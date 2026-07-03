@@ -1184,6 +1184,25 @@ class GPUModelRunner(
 
         reset_rows(self.compilation_config.static_forward_context, row_ids)
 
+    def _hisparse_warm_start(
+        self, row_ids: list[int], requests: list[CachedRequestState]
+    ) -> None:
+        """Stage new requests' newest context rows into their hot buffers."""
+        attention_config = self.vllm_config.attention_config
+        if attention_config is None or not attention_config.enable_hisparse:
+            return
+        if not row_ids:
+            return
+
+        from vllm.v1.attention.backends.mla.hisparse import warm_start_requests
+
+        warm_start_requests(
+            self.compilation_config.static_forward_context,
+            row_ids,
+            [(req.block_ids[0], req.num_computed_tokens) for req in requests],
+            self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size,
+        )
+
     def _hisparse_set_num_real_reqs(self, num_reqs: int) -> None:
         """Publish the real (unpadded) request count for the swap-in kernel.
 
@@ -1551,11 +1570,13 @@ class GPUModelRunner(
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         hisparse_new_rows: list[int] = []
+        hisparse_new_reqs: list[CachedRequestState] = []
         for request in reqs_to_add:
             self.input_batch.add_request(request)
             req_index = self.input_batch.req_id_to_index.get(request.req_id)
             if req_index is not None:
                 hisparse_new_rows.append(req_index)
+                hisparse_new_reqs.append(request)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
         # Rows are safe against async KV receives (NIXL RDMA, Mooncake store
         # loads) without a per-connector signal: a receiving request is only
@@ -1563,6 +1584,7 @@ class GPUModelRunner(
         # here, and _hisparse_invalidate_new_request_blocks dropped stale hot
         # copies of its (freshly assigned) block slots across all rows.
         self._hisparse_reset_batch_rows(hisparse_new_rows)
+        self._hisparse_warm_start(hisparse_new_rows, hisparse_new_reqs)
 
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
@@ -7180,7 +7202,12 @@ class GPUModelRunner(
             if bool(host_resident_layers) and all(
                 name in host_resident_layers for name in kv_cache_tensor.shared_by
             ):
-                tensor = torch.zeros(
+                # empty, not zeros: zero-filling a pinned pool of this size is
+                # a serial multi-GB CPU memset per rank (tens of minutes of
+                # apparent boot hang across a node's ranks), and the pool
+                # never needs it — every slot the scheduler hands out is
+                # written before the indexer can select it.
+                tensor = torch.empty(
                     kv_cache_tensor.size,
                     dtype=torch.int8,
                     device="cpu",
