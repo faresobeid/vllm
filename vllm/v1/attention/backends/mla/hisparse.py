@@ -104,6 +104,31 @@ class HiSparseConfig:
         if host_pool_gib is not None and host_pool_gib <= 0:
             raise ValueError("HiSparse host_pool_gib must be positive when set.")
 
+        # Hot buffers are allocated eagerly per layer and scale with
+        # max_num_seqs; a too-large default (e.g. 1024 seqs on GLM-5.2 at
+        # dbs=4096: ~2.7 MB/req/layer -> ~170 GB/rank) otherwise surfaces as
+        # an unrelated CUDA OOM at load time (DeepEP buffers, weights, ...).
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        num_layers = vllm_config.model_config.get_num_layers(
+            vllm_config.parallel_config
+        )
+        # fp8_ds_mla row (656 B) as the sizing estimate; bf16 rows are larger.
+        est_hot_bytes = (
+            num_layers * max_num_seqs * round_up(device_buffer_size + 1, 128) * 656
+        )
+        total_gpu = torch.cuda.get_device_properties(0).total_memory
+        if est_hot_bytes > 0.5 * total_gpu:
+            logger.warning(
+                "HiSparse hot buffers would need >= %.1f GiB of GPU memory "
+                "(%d layers x max_num_seqs=%d x device_buffer_size=%d). This "
+                "usually OOMs at model load; lower max_num_seqs on decode "
+                "instances (e.g. 96 for GLM-5.2 P/D).",
+                est_hot_bytes / 2**30,
+                num_layers,
+                max_num_seqs,
+                device_buffer_size,
+            )
+
         return cls(
             top_k=top_k,
             device_buffer_size=device_buffer_size,
