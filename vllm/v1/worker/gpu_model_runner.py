@@ -1221,13 +1221,15 @@ class GPUModelRunner(
     def _hisparse_check_host_memory(
         self, kv_cache_config, host_resident_layers: set[str]
     ) -> None:
-        """Fail fast if the node cannot hold every rank's pinned host pool.
+        """Fail fast when this rank's pinned host pool cannot fit in RAM.
 
-        The pool is allocated per rank; every co-located rank (TP peers, DP
-        engines on the same node) pins its own copy, and hosts often run
-        co-tenants with large RAM appetites (CPU KV stores, RL
-        orchestrators). A partial cudaHostAlloc failure mid-startup or an
-        OOM-killed co-tenant is much harder to diagnose than this error.
+        Each rank checks only its OWN pool bytes against currently available
+        RAM: peers allocate concurrently, so checking the full-node need
+        against a snapshot that already reflects peers' pins would
+        double-count and spuriously reject fitting configs. A node-wide
+        advisory (total RAM vs all co-located ranks, including PP stages)
+        is emitted once, since a partial cudaHostAlloc failure mid-startup or
+        an OOM-killed co-tenant is much harder to diagnose than this warning.
         """
         import psutil
 
@@ -1236,23 +1238,34 @@ class GPUModelRunner(
             for t in kv_cache_config.kv_cache_tensors
             if all(name in host_resident_layers for name in t.shared_by)
         )
+        mem = psutil.virtual_memory()
+        if rank_bytes > mem.available * 0.95:
+            raise ValueError(
+                f"HiSparse pinned host pool needs ~{rank_bytes / 2**30:.0f} "
+                f"GiB on this rank but only {mem.available / 2**30:.0f} GiB "
+                "of RAM is available. Lower hisparse_config.host_pool_gib or "
+                "leave headroom for co-tenants (KV stores, orchestrators)."
+            )
         parallel = self.vllm_config.parallel_config
-        # Conservative per-node rank count: TP peers x locally-hosted DP
-        # engines. Over-counts when TP spans nodes, which only makes the
-        # check stricter.
-        ranks_on_node = parallel.tensor_parallel_size * max(
-            parallel.data_parallel_size_local, 1
+        # Conservative per-node rank count: TP peers x PP stages x
+        # locally-hosted DP engines. Over-counts when TP/PP spans nodes,
+        # which is acceptable for a warning.
+        ranks_on_node = (
+            parallel.tensor_parallel_size
+            * parallel.pipeline_parallel_size
+            * max(parallel.data_parallel_size_local, 1)
         )
         need = rank_bytes * ranks_on_node
-        avail = psutil.virtual_memory().available
-        if need > avail * 0.95:
-            raise ValueError(
-                f"HiSparse pinned host pools need ~{need / 2**30:.0f} GiB on "
-                f"this node ({ranks_on_node} ranks x "
-                f"{rank_bytes / 2**30:.0f} GiB) but only "
-                f"{avail / 2**30:.0f} GiB of RAM is available. Lower "
-                "hisparse_config.host_pool_gib or leave headroom for "
-                "co-tenants (KV stores, orchestrators)."
+        if need > mem.total * 0.95 and parallel.rank == 0:
+            logger.warning(
+                "HiSparse pinned host pools may need ~%.0f GiB on this node "
+                "(%d ranks x %.0f GiB) but it has %.0f GiB of RAM total. "
+                "Expect pinned allocation failures; lower "
+                "hisparse_config.host_pool_gib.",
+                need / 2**30,
+                ranks_on_node,
+                rank_bytes / 2**30,
+                mem.total / 2**30,
             )
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
@@ -1569,27 +1582,33 @@ class GPUModelRunner(
 
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
-        hisparse_new_rows: list[int] = []
         hisparse_new_reqs: list[CachedRequestState] = []
         for request in reqs_to_add:
             self.input_batch.add_request(request)
-            req_index = self.input_batch.req_id_to_index.get(request.req_id)
-            if req_index is not None:
-                hisparse_new_rows.append(req_index)
+            if request.req_id in self.input_batch.req_id_to_index:
                 hisparse_new_reqs.append(request)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
-        # Rows are safe against async KV receives (NIXL RDMA, Mooncake store
-        # loads) without a per-connector signal: a receiving request is only
-        # admitted after its receive completes, so its row was just reset
-        # here, and _hisparse_invalidate_new_request_blocks dropped stale hot
-        # copies of its (freshly assigned) block slots across all rows.
-        self._hisparse_reset_batch_rows(hisparse_new_rows)
-        self._hisparse_warm_start(hisparse_new_rows, hisparse_new_reqs)
 
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
         # Allow attention backend to reorder the batch, potentially
         self._may_reorder_batch(scheduler_output)
+
+        # Reset + warm-start on the requests' FINAL rows: condense/reorder can
+        # move a just-added request (e.g. short_extend classification swaps it
+        # past the decode region) and per-row hot state does not follow moves.
+        # Rows are safe against async KV receives (NIXL RDMA, Mooncake store
+        # loads) without a per-connector signal: a receiving request is only
+        # admitted after its receive completes, so its row is reset here, and
+        # _hisparse_invalidate_new_request_blocks dropped stale hot copies of
+        # its (freshly assigned) block slots across all rows.
+        if hisparse_new_reqs:
+            hisparse_new_rows = [
+                self.input_batch.req_id_to_index[req.req_id]
+                for req in hisparse_new_reqs
+            ]
+            self._hisparse_reset_batch_rows(hisparse_new_rows)
+            self._hisparse_warm_start(hisparse_new_rows, hisparse_new_reqs)
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
 

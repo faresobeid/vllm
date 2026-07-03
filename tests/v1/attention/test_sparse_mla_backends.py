@@ -46,6 +46,7 @@ from vllm.v1.attention.backends.mla.hisparse import (
     HiSparseConfig,
     HiSparseCoordinator,
     _has_hisparse_ops,
+    build_warm_start_slots,
     create_hisparse_coordinator,
     is_hisparse_decode_batch,
 )
@@ -912,6 +913,13 @@ def test_hisparse_config_validation():
     assert coordinator.region_stride % 64 == 0
     assert coordinator.region_stride > cfg.device_buffer_size
 
+    vllm_config.attention_config.hisparse_config = {
+        "top_k": 128,
+        "warm_stat": True,
+    }
+    with pytest.raises(ValueError, match="Unknown hisparse_config keys"):
+        HiSparseConfig.from_vllm_config(vllm_config, model_top_k=128)
+
 
 def test_hisparse_host_pool_config_option():
     vllm_config = _make_hisparse_vllm_config()
@@ -1647,3 +1655,33 @@ def test_hisparse_warm_start_rows():
         coordinator.hot_cache[1 * stride + 3].cpu(), flat_pool[11]
     )
     assert coordinator.device_global_indices[1].cpu().tolist() == [8, 9, 10, 11]
+
+
+def test_hisparse_build_warm_start_slots():
+    """Vectorized slot builder matches the per-token reference loop."""
+    block_size = 4
+    max_width = 6
+    contexts = [
+        ([3, 1, 7, 2], 14),  # longer than max_width: newest 6 of 14
+        ([5, 0], 5),  # shorter than max_width
+        ([9], 0),  # no computed context
+        ([2, 8, 4], 12),  # capped exactly at a block boundary
+    ]
+
+    slots, lens = build_warm_start_slots(contexts, block_size, max_width)
+
+    expected_lens = [min(max_width, n) for _, n in contexts]
+    assert lens.tolist() == expected_lens
+    width = max(expected_lens)
+    assert slots.shape == (len(contexts), width)
+    for i, (block_ids, num_computed) in enumerate(contexts):
+        n = expected_lens[i]
+        expected = [
+            block_ids[t // block_size] * block_size + t % block_size
+            for t in range(num_computed - n, num_computed)
+        ]
+        assert slots[i].tolist() == expected + [-1] * (width - n)
+
+    slots, lens = build_warm_start_slots([([1], 0), ([2], 0)], block_size, max_width)
+    assert slots.shape == (2, 0)
+    assert lens.tolist() == [0, 0]

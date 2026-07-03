@@ -34,6 +34,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from vllm.config import VllmConfig
@@ -88,6 +89,20 @@ class HiSparseConfig:
             raise ValueError(
                 "HiSparse requires attention_config.hisparse_config with "
                 "top_k, device_buffer_size, and host_to_device_ratio."
+            )
+
+        known_keys = {
+            "top_k",
+            "device_buffer_size",
+            "host_to_device_ratio",
+            "host_pool_gib",
+            "warm_start",
+        }
+        unknown_keys = set(raw_config) - known_keys
+        if unknown_keys:
+            raise ValueError(
+                f"Unknown hisparse_config keys: {sorted(unknown_keys)}. "
+                f"Known keys: {sorted(known_keys)}."
             )
 
         top_k = int(raw_config.get("top_k", model_top_k))
@@ -286,6 +301,33 @@ def reset_rows(static_forward_context: dict, row_ids: list[int]) -> None:
         coordinator.reset_hot_rows(rows)
 
 
+def build_warm_start_slots(
+    contexts: list[tuple[list[int], int]], block_size: int, max_width: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-request newest context slot ids as a padded matrix.
+
+    Returns ``(slots, lens)``: ``slots`` is ``[num_reqs, width]`` int32, each
+    row that request's newest ``min(max_width, num_computed)`` context slot
+    ids oldest-first, -1-padded on the right; ``lens`` holds the unpadded
+    lengths. ``width`` is 0 when no request has computed context.
+    """
+    lens = np.fromiter(
+        (min(max_width, num_computed) for _, num_computed in contexts),
+        dtype=np.int64,
+        count=len(contexts),
+    )
+    width = int(lens.max(initial=0))
+    slots = np.full((len(contexts), width), -1, dtype=np.int32)
+    for i, (block_ids, num_computed) in enumerate(contexts):
+        n = int(lens[i])
+        if n == 0:
+            continue
+        tokens = np.arange(num_computed - n, num_computed, dtype=np.int64)
+        blocks = np.asarray(block_ids, dtype=np.int64)
+        slots[i, :n] = blocks[tokens // block_size] * block_size + tokens % block_size
+    return slots, lens
+
+
 def warm_start_requests(
     static_forward_context: dict,
     row_ids: list[int],
@@ -295,12 +337,17 @@ def warm_start_requests(
     """Preload each new request's newest context rows into its hot buffers.
 
     A request arriving on a decode instance starts with an empty hot buffer, so
-    its first steps miss on every top-k entry. This gathers the newest
-    ``device_buffer_size`` context rows from the host pool during batch
-    preparation (outside CUDA-graph capture), converting those first-step
-    misses into hits; the indexer top-k's recency skew makes the newest rows
-    the right prefix to stage. ``contexts`` pairs each row's block ids with its
-    computed-token count. Must run after ``reset_rows`` for the same rows.
+    its first steps miss on every top-k entry. This gathers the newest context
+    rows from the host pool during batch preparation (outside CUDA-graph
+    capture), converting those first-step misses into hits; the indexer
+    top-k's recency skew makes the newest rows the right prefix to stage.
+    ``contexts`` pairs each row's block ids with its computed-token count.
+    Must run after ``reset_rows`` for the same rows, on the requests' FINAL
+    batch rows (after condense/reorder). Requires the staged KV to already be
+    resident in the host pool at batch-add time — true for async-gated
+    connectors (NIXL, Mooncake store), which only admit a request after its
+    receive completed; a same-step synchronous KV load would be staged as
+    garbage.
     """
     if not row_ids:
         return
@@ -308,29 +355,51 @@ def warm_start_requests(
     if not leaders or not leaders[0].config.warm_start:
         return
     device = leaders[0].device
-    buf = leaders[0].config.device_buffer_size
-
-    slot_lists: list[list[int]] = []
-    for block_ids, num_computed in contexts:
-        n = min(buf, num_computed)
-        slot_lists.append(
-            [
-                block_ids[t // block_size] * block_size + t % block_size
-                for t in range(num_computed - n, num_computed)
-            ]
-        )
-    width = max(map(len, slot_lists))
-    if width == 0:
+    config = leaders[0].config
+    # Only top_k positions can be selected per step, so staging beyond the
+    # newest top_k has the lowest hit probability per transferred byte;
+    # leftover empty LRU slots absorb future misses without evictions.
+    max_width = min(config.device_buffer_size, config.top_k)
+    slots_np, lens_np = build_warm_start_slots(contexts, block_size, max_width)
+    if slots_np.shape[1] == 0:
         return
-    padded = [slots + [-1] * (width - len(slots)) for slots in slot_lists]
 
     rows = torch.tensor(row_ids, dtype=torch.long, device=device)
-    global_slots = torch.tensor(padded, dtype=torch.int32, device=device)
-    lens = torch.tensor(
-        [len(slots) for slots in slot_lists], dtype=torch.long, device=device
-    )
+    global_slots = torch.from_numpy(slots_np).to(device)
+    lens = torch.from_numpy(lens_np).to(device)
+    # The staging plan (hot positions, miss mask, rotated LRU) is identical
+    # for every group: compute it once and share it across leaders.
+    plan = _warm_start_plan(rows, global_slots, lens, leaders[0])
     for leader in leaders:
-        leader.warm_start_rows(rows, global_slots, lens)
+        leader._warm_start_with_plan(rows, global_slots, plan)
+
+
+def _warm_start_plan(
+    rows: torch.Tensor,
+    global_slots: torch.Tensor,
+    lens: torch.Tensor,
+    coordinator: HiSparseCoordinator,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Staging plan shared by every group: position i of a row's hot region
+    holds its i-th staged slot (oldest first); the LRU is rotated so
+    still-empty positions are consumed by misses before any staged row is
+    evicted, oldest staged first."""
+    device = rows.device
+    width = global_slots.shape[1]
+    hot_indices = (
+        (rows * coordinator.region_stride).to(torch.int32).unsqueeze(1)
+        + torch.arange(width, dtype=torch.int32, device=device)
+    ).contiguous()
+    miss_mask = (global_slots >= 0).to(torch.int32)
+    buf = coordinator.config.device_buffer_size
+    lru = (
+        (
+            torch.arange(buf, dtype=torch.long, device=device).unsqueeze(0)
+            + lens.unsqueeze(1)
+        )
+        % buf
+    ).to(torch.int16)
+    return hot_indices, miss_mask, lru
 
 
 # Shared all-true validity bitmap for host-resident pools: every slot the
@@ -637,24 +706,33 @@ class HiSparseCoordinator:
 
         ``global_slots`` is ``[num_rows, width]`` int32, each row the newest
         context slots oldest-first, -1-padded on the right; ``lens`` holds the
-        unpadded lengths. The gather runs on the current stream during batch
-        preparation, so it is ordered before the step's swap-in. Every group
-        member's hot cache is staged at the same positions (shared layers only
-        gather misses when replaying the leader's plan), but only the leader
-        publishes dgi/lru.
+        unpadded lengths.
         """
-        if not (self._use_cuda_ops and self._source_is_host):
-            return
+        self._warm_start_with_plan(
+            rows, global_slots, _warm_start_plan(rows, global_slots, lens, self)
+        )
+
+    def _warm_start_with_plan(
+        self,
+        rows: torch.Tensor,
+        global_slots: torch.Tensor,
+        plan: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> None:
+        """Stage + publish one group's warm start per a shared plan.
+
+        The gather runs on the current stream during batch preparation, so it
+        is ordered before the step's swap-in. Every group member's hot cache
+        is staged at the same positions (shared layers only gather misses when
+        replaying the leader's plan), but only the leader publishes dgi/lru —
+        so staging must be all-of-group or none.
+        """
         group = [self, *self.group_shared]
+        if not all(c._use_cuda_ops and c._source_is_host for c in group):
+            return
         if any(coord._host_cache is None for coord in group):
             # Not fully bound yet (first forwards); the miss path covers it.
             return
-        width = global_slots.shape[1]
-        hot_indices = (
-            (rows * self.region_stride).to(torch.int32).unsqueeze(1)
-            + torch.arange(width, dtype=torch.int32, device=self.device)
-        ).contiguous()
-        miss_mask = (global_slots >= 0).to(torch.int32)
+        hot_indices, miss_mask, lru = plan
         for coord in group:
             torch.ops._C_cache_ops.hisparse_gather_plan(
                 coord.hot_cache,
@@ -666,16 +744,9 @@ class HiSparseCoordinator:
                 miss_mask,
                 None,
             )
-        # Publish the staged rows as hits: position i holds the i-th slot
-        # (oldest first). LRU rotated so still-empty positions are consumed
-        # by misses before any staged row is evicted, oldest staged first.
+        width = global_slots.shape[1]
         self.device_global_indices[rows, :width] = global_slots
-        buf = self.config.device_buffer_size
-        lru = (
-            torch.arange(buf, dtype=torch.long, device=self.device).unsqueeze(0)
-            + lens.unsqueeze(1)
-        ) % buf
-        self.lru_slots[rows] = lru.to(torch.int16)
+        self.lru_slots[rows] = lru
 
     def _invalidate_hot_copies(self, slots: torch.Tensor) -> None:
         stale = torch.isin(
@@ -955,8 +1026,11 @@ class HiSparseCoordinator:
         # this step, keyed by their global slot id from the slot mapping.
         # When slot_mapping is None (mixed batches: the newest rows were
         # written to the host pool, not the reserved hot slots), newest
-        # tokens are resolved like any other entry (miss -> host load); the
-        # backup kernel runs stream-ordered, so those rows are visible.
+        # tokens are resolved like any other entry (miss -> host load). That
+        # is only visible for THIS layer's compute-stream gather (its own
+        # backup ran earlier in the same forward); the overlapped prefetch of
+        # the group's shared layers is gated off below, since it would read
+        # host rows their backups have not written yet.
         newest_global = (
             slot_mapping[:num_tokens].to(torch.int32).contiguous()
             if slot_mapping is not None
@@ -1009,10 +1083,19 @@ class HiSparseCoordinator:
         if produce_plan:
             # Shared layers reuse the group's counts (identical top-k).
             self._plan.valid_counts = valid_counts
-            # Overlapped prefetch: issue the group's shared gathers early on the copy
-            # stream so their PCIe transfer overlaps intervening compute.
+            # Overlapped prefetch: issue the group's shared gathers early on
+            # the copy stream so their PCIe transfer overlaps intervening
+            # compute. Pure decode only (slot_mapping present): with
+            # slot_mapping=None the newest tokens are in the miss set, served
+            # from host rows the shared layers' own backups have not written
+            # yet when the copy stream forks. apply_plan then gathers inline
+            # on the compute stream, which IS ordered after each backup.
             if self._overlap_enabled and self.group_shared:
-                self._prefetch_group(num_tokens)
+                if slot_mapping is not None:
+                    self._prefetch_group(num_tokens)
+                else:
+                    for shared in self.group_shared:
+                        shared._prefetch_event = None
 
         if valid_counts is None:
             return self.hot_cache_paged(block_size), hot_indices
