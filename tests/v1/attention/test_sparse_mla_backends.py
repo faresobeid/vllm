@@ -1578,3 +1578,75 @@ def test_hisparse_host_resident_pool():
     torch.testing.assert_close(
         flat_hot[idx].cpu(), torch.cat([kv_c2[0], k_pe2[0, 0]]).cpu()
     )
+
+
+def test_hisparse_warm_start_rows():
+    """Warm-started slots resolve as hits; misses consume empty slots first."""
+    device = torch.device(DEVICE_TYPE)
+    block_size = 4
+    row_width = 8
+    num_blocks = 8
+
+    kv_pool = torch.arange(
+        num_blocks * block_size * row_width, dtype=torch.float32
+    ).view(num_blocks, block_size, row_width).pin_memory()
+    flat_pool = kv_pool.reshape(-1, row_width)
+
+    coordinator = _make_hisparse_coordinator()
+    if not coordinator._use_cuda_ops:
+        pytest.skip("warm start requires the HiSparse CUDA ops")
+    buf = coordinator.config.device_buffer_size
+    stride = coordinator.region_stride
+    coordinator.bind_source_cache(kv_pool)
+    assert coordinator.source_is_host
+
+    # Row 1: partial staging (3 of 4 positions) of context slots 8, 9, 10
+    # (block 2, oldest first). Row 0: full staging of slots 4..7 (block 1).
+    rows = torch.tensor([0, 1], dtype=torch.long, device=device)
+    coordinator.reset_hot_rows(rows)
+    coordinator.warm_start_rows(
+        rows,
+        torch.tensor([[4, 5, 6, 7], [8, 9, 10, -1]], dtype=torch.int32,
+                     device=device),
+        torch.tensor([4, 3], dtype=torch.long, device=device),
+    )
+    torch.cuda.synchronize()
+
+    # Staged bytes landed at region positions 0..n-1 (oldest first).
+    for i, g in enumerate([4, 5, 6, 7]):
+        torch.testing.assert_close(
+            coordinator.hot_cache[0 * stride + i].cpu(), flat_pool[g]
+        )
+    for i, g in enumerate([8, 9, 10]):
+        torch.testing.assert_close(
+            coordinator.hot_cache[1 * stride + i].cpu(), flat_pool[g]
+        )
+    # dgi published; LRU rotated so the empty position is consumed first.
+    assert coordinator.device_global_indices[1].cpu().tolist() == [8, 9, 10, -1]
+    assert coordinator.lru_slots[1].cpu().tolist() == [3, 0, 1, 2]
+    assert coordinator.lru_slots[0].cpu().tolist() == [0, 1, 2, 3]
+
+    # Swap-in over both rows: row 0 hits all staged slots in place; row 1
+    # hits its 3 staged slots and its miss (slot 11) must fill the empty
+    # position 3, not evict a staged row.
+    block_table = torch.tensor([[1, -1], [2, -1]], dtype=torch.int32,
+                               device=device)
+    req_ids = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    topk = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32,
+                        device=device)
+    _, hot_indices = coordinator.swap_in(
+        kv_cache=kv_pool,
+        req_id_per_token=req_ids,
+        block_table=block_table,
+        topk_indices=topk,
+        block_size=block_size,
+        slot_mapping=None,
+    )
+    torch.cuda.synchronize()
+    assert hot_indices.cpu().tolist()[0] == [0, 1, 2, 3]
+    row1 = [h - stride for h in hot_indices.cpu().tolist()[1]]
+    assert row1 == [0, 1, 2, 3]
+    torch.testing.assert_close(
+        coordinator.hot_cache[1 * stride + 3].cpu(), flat_pool[11]
+    )
+    assert coordinator.device_global_indices[1].cpu().tolist() == [8, 9, 10, 11]
