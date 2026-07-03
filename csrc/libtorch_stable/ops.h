@@ -515,6 +515,8 @@ void concat_and_cache_mla(torch::stable::Tensor& kv_c,
                           const std::string& kv_cache_dtype,
                           torch::stable::Tensor& scale);
 
+#ifndef USE_ROCM
+// HiSparse kernels use raw PTX in the row copy; CUDA-only.
 void hisparse_swap_in(
     torch::stable::Tensor const& source_cache,
     torch::stable::Tensor const& host_cache,
@@ -545,6 +547,7 @@ void hisparse_backup(torch::stable::Tensor const& src_cache,
                      torch::stable::Tensor& host_cache,
                      torch::stable::Tensor& host_cache_valid,
                      torch::stable::Tensor const& dst_slots);
+#endif  // !USE_ROCM
 
 // NOTE: k_pe and kv_c order is flipped compared to concat_and_cache_mla
 void concat_and_cache_mla_rope_fused(

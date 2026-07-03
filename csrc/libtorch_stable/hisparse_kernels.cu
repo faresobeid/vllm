@@ -19,6 +19,7 @@
 #include "ops.h"
 #include "../cuda_utils.h"
 
+#include <algorithm>
 #include <cstdint>
 
 namespace {
@@ -57,6 +58,20 @@ __device__ __forceinline__ void copy_row_warp(int lane_id, const char* src,
   }
 }
 
+// Zero one row with a single warp (16B vectorized, L2-only stores), same
+// addressing contract as copy_row_warp.
+__device__ __forceinline__ void zero_row_warp(int lane_id, char* dst,
+                                              int64_t row_bytes) {
+  const int64_t num_vec = row_bytes / 16;
+  uint64_t* dst8 = reinterpret_cast<uint64_t*>(dst);
+  for (int64_t j = lane_id; j < num_vec; j += kWarpSize) {
+    uint64_t* d = dst8 + j * 2;
+    asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(d), "l"(0ULL),
+                 "l"(0ULL)
+                 : "memory");
+  }
+}
+
 // In-place inclusive scan over s_data[offset, count) performed by warp 0,
 // carrying `accumulator` across calls. Returns the running total.
 __device__ __forceinline__ int warp_inclusive_scan(int32_t* s_data,
@@ -87,7 +102,6 @@ __device__ __forceinline__ int warp_inclusive_scan(int32_t* s_data,
 //   s_counters[2]            [0] buffer hits, [1] resolved-in-phase-1 count
 //   s_lru_out[hot_size]      int16, compacted slots: [hits fwd | evict bwd]
 //   s_hash_vals[hash_size]   int16 hash values (top-k index)
-template <int BLOCK_SIZE>
 __global__ void hisparse_swap_in_kernel(
     const char* __restrict__ source_cache,        // [source_rows, row_bytes]
     const char* __restrict__ host_cache,          // [host_rows, row_bytes]
@@ -104,7 +118,7 @@ __global__ void hisparse_swap_in_kernel(
     const int64_t source_rows, const int64_t host_rows,
     const int64_t row_bytes, const int32_t top_k, const int32_t hot_size,
     const int32_t hash_size, const int64_t region_stride) {
-  constexpr int NUM_WARPS = BLOCK_SIZE / kWarpSize;
+  const int NUM_WARPS = blockDim.x / kWarpSize;
   const int num_buffer_chunks = (hot_size + kWarpSize - 1) / kWarpSize;
   const int num_token_chunks = (top_k + kWarpSize - 1) / kWarpSize;
 
@@ -145,17 +159,17 @@ __global__ void hisparse_swap_in_kernel(
   if (tid < 2) {
     s_counters[tid] = 0;
   }
-  for (int i = tid; i < hash_size; i += BLOCK_SIZE) {
+  for (int i = tid; i < hash_size; i += blockDim.x) {
     s_hash_keys[i] = kHashEmpty;
   }
-  for (int i = tid; i < num_buffer_chunks + 1; i += BLOCK_SIZE) {
+  for (int i = tid; i < num_buffer_chunks + 1; i += blockDim.x) {
     s_chunk_off[i] = 0;
     s_evict_off[i] = 0;
   }
   __syncthreads();
 
   // Phase 1: resolve invalid / newest entries, hash the rest.
-  for (int i = tid; i < top_k; i += BLOCK_SIZE) {
+  for (int i = tid; i < top_k; i += blockDim.x) {
     const int32_t g = row_topk[i];
     if (row_miss != nullptr) row_miss[i] = 0;
     if (g < 0) {
@@ -257,7 +271,7 @@ __global__ void hisparse_swap_in_kernel(
 
   // Reset prefix sums for the miss compaction (token chunks <= buffer
   // chunks because hot_size >= top_k).
-  for (int i = tid; i < num_token_chunks + 1; i += BLOCK_SIZE) {
+  for (int i = tid; i < num_token_chunks + 1; i += blockDim.x) {
     s_chunk_off[i] = 0;
   }
   __syncthreads();
@@ -324,7 +338,7 @@ __global__ void hisparse_swap_in_kernel(
   // Phase 4: write back the LRU order: stale evictables at the front,
   // freshly loaded misses next, hits at the MRU back.
   const int total_evictable = hot_size - total_hits;
-  for (int i = tid; i < hot_size; i += BLOCK_SIZE) {
+  for (int i = tid; i < hot_size; i += blockDim.x) {
     if (i < total_misses) {
       row_lru[total_evictable - total_misses + i] =
           s_lru_out[hot_size - 1 - i];
@@ -350,6 +364,16 @@ __global__ void hisparse_swap_in_kernel(
     }
     if (src != nullptr) {
       copy_row_warp(lane_id, src, dst, row_bytes);
+    } else {
+      // No valid source for g: never serve the evicted slot's stale bytes
+      // as g. Zero the row (deterministic, visible in output quality) and
+      // withdraw the phase-3 ownership claim so later steps re-miss instead
+      // of hitting the unfilled slot.
+      zero_row_warp(lane_id, dst, row_bytes);
+      __syncwarp();
+      if (lane_id == 0) {
+        row_dgi[evict_slot] = -1;
+      }
     }
   }
 }
@@ -360,7 +384,6 @@ __global__ void hisparse_swap_in_kernel(
 // index-sharing shared layers see identical global_indices/hot_indices, so the
 // slot assignment is identical -- only the per-layer bytes differ. Fixed shape
 // (num_rows x top_k), so it is CUDA-graph-capture safe.
-template <int BLOCK_SIZE>
 __global__ void hisparse_gather_plan_kernel(
     const char* __restrict__ source_cache,        // [source_rows, row_bytes]
     const char* __restrict__ host_cache,          // [host_rows, row_bytes]
@@ -371,24 +394,30 @@ __global__ void hisparse_gather_plan_kernel(
     const int32_t* __restrict__ miss_mask,        // [num_rows, top_k]
     const int32_t* __restrict__ num_real_reqs,    // [1] or nullptr
     const int64_t source_rows, const int64_t host_rows,
-    const int64_t row_bytes, const int32_t top_k) {
-  constexpr int NUM_WARPS = BLOCK_SIZE / kWarpSize;
+    const int64_t hot_rows, const int64_t row_bytes, const int32_t top_k) {
+  const int NUM_WARPS = blockDim.x / kWarpSize;
+  // Columns are interleaved across gridDim.y blocks per row so few-row
+  // launches (warm-start staging) still fill the device with outstanding
+  // host reads instead of starving on one block per row.
   const int row = blockIdx.x;
   if (num_real_reqs != nullptr && row >= num_real_reqs[0]) {
     return;
   }
   const int warp_id = threadIdx.x / kWarpSize;
   const int lane_id = threadIdx.x % kWarpSize;
+  const int col_start = blockIdx.y * NUM_WARPS + warp_id;
+  const int col_stride = gridDim.y * NUM_WARPS;
   const int64_t base = static_cast<int64_t>(row) * top_k;
-  for (int col = warp_id; col < top_k; col += NUM_WARPS) {
+  for (int col = col_start; col < top_k; col += col_stride) {
     if (miss_mask[base + col] == 0) {
       continue;
     }
     const int32_t g = global_indices[base + col];
     const int32_t dst = hot_indices[base + col];
-    if (g < 0 || dst < 0) {
+    if (g < 0 || dst < 0 || dst >= hot_rows) {
       continue;
     }
+    char* dst_row = hot_cache + static_cast<int64_t>(dst) * row_bytes;
     const char* src = nullptr;
     if (g < host_rows && host_cache_valid[g]) {
       src = host_cache + static_cast<int64_t>(g) * row_bytes;
@@ -396,8 +425,11 @@ __global__ void hisparse_gather_plan_kernel(
       src = source_cache + static_cast<int64_t>(g) * row_bytes;
     }
     if (src != nullptr) {
-      copy_row_warp(lane_id, src,
-                    hot_cache + static_cast<int64_t>(dst) * row_bytes, row_bytes);
+      copy_row_warp(lane_id, src, dst_row, row_bytes);
+    } else {
+      // No valid source for g: zero the planned slot rather than serving
+      // whatever bytes it held (see the swap-in kernel's phase 5).
+      zero_row_warp(lane_id, dst_row, row_bytes);
     }
   }
 }
@@ -405,13 +437,12 @@ __global__ void hisparse_gather_plan_kernel(
 // One warp per item: gather `src_cache[src_indices[i]]` into
 // `host_cache[dst_slots[i]]` and mark the row valid. Used to mirror KV rows
 // into the pinned host cache fully stream-ordered (no host synchronization).
-template <int BLOCK_SIZE>
 __global__ void hisparse_backup_kernel(
     const char* __restrict__ src_cache, const int64_t* __restrict__ src_indices,
     char* __restrict__ host_cache, bool* __restrict__ host_cache_valid,
     const int64_t* __restrict__ dst_slots, const int64_t row_bytes,
     const int32_t num_items, const int64_t src_rows, const int64_t host_rows) {
-  constexpr int NUM_WARPS = BLOCK_SIZE / kWarpSize;
+  const int NUM_WARPS = blockDim.x / kWarpSize;
   const int lane_id = threadIdx.x % kWarpSize;
   const int warp_id = blockIdx.x * NUM_WARPS + threadIdx.x / kWarpSize;
   const int total_warps = gridDim.x * NUM_WARPS;
@@ -564,7 +595,7 @@ void hisparse_swap_in(torch::stable::Tensor const& source_cache,
 
   const torch::stable::accelerator::DeviceGuard device_guard(hot_cache.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
-  auto kernel = hisparse_swap_in_kernel<kBlockSize>;
+  auto kernel = hisparse_swap_in_kernel;
   if (smem_bytes > 48 * 1024) {
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          smem_bytes);
@@ -642,9 +673,18 @@ void hisparse_gather_plan(torch::stable::Tensor const& source_cache,
   // layers' misses (index-sharing replay), so per-row copy parallelism is
   // the throughput limiter on cold rows.
   constexpr int kBlockSize = 1024;
+  constexpr int kNumWarps = kBlockSize / kWarpSize;
+  // Interleave columns over enough blocks per row to cover the device even
+  // for few-row launches (warm-start staging), keeping >= 1 column per warp.
+  constexpr int kTargetBlocks = 256;
+  const int max_chunks = std::max(1, (top_k + kNumWarps - 1) / kNumWarps);
+  const int num_chunks =
+      std::min(max_chunks, std::max(1, kTargetBlocks / num_rows));
+  const dim3 grid(num_rows, num_chunks);
+  const int64_t hot_rows = hot_cache_2d.size(0);
   const torch::stable::accelerator::DeviceGuard device_guard(hot_cache.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
-  hisparse_gather_plan_kernel<kBlockSize><<<num_rows, kBlockSize, 0, stream>>>(
+  hisparse_gather_plan_kernel<<<grid, kBlockSize, 0, stream>>>(
       static_cast<const char*>(source_2d.const_data_ptr()),
       static_cast<const char*>(host_cache.const_data_ptr()),
       host_cache_valid.const_data_ptr<bool>(),
@@ -652,7 +692,7 @@ void hisparse_gather_plan(torch::stable::Tensor const& source_cache,
       global_indices.const_data_ptr<int32_t>(),
       hot_indices.const_data_ptr<int32_t>(),
       miss_mask.const_data_ptr<int32_t>(), num_real_ptr, source_rows, host_rows,
-      row_bytes, top_k);
+      hot_rows, row_bytes, top_k);
 }
 
 void hisparse_backup(torch::stable::Tensor const& src_cache,
@@ -696,7 +736,7 @@ void hisparse_backup(torch::stable::Tensor const& src_cache,
 
   const torch::stable::accelerator::DeviceGuard device_guard(src_cache.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
-  hisparse_backup_kernel<kBlockSize><<<grid, kBlockSize, 0, stream>>>(
+  hisparse_backup_kernel<<<grid, kBlockSize, 0, stream>>>(
       static_cast<const char*>(src_2d.const_data_ptr()),
       src_indices.const_data_ptr<int64_t>(),
       static_cast<char*>(host_cache.mutable_data_ptr()),

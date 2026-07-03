@@ -1655,6 +1655,9 @@ def test_hisparse_warm_start_rows():
         coordinator.hot_cache[1 * stride + 3].cpu(), flat_pool[11]
     )
     assert coordinator.device_global_indices[1].cpu().tolist() == [8, 9, 10, 11]
+    # In-kernel telemetry: row 0 hit all 4 staged slots, row 1 hit its 3
+    # staged slots and missed slot 11.
+    assert coordinator._swap_stats.cpu().tolist() == [7, 1]
 
 
 def test_hisparse_build_warm_start_slots():
