@@ -1199,6 +1199,43 @@ class GPUModelRunner(
 
         set_num_real_reqs(num_reqs)
 
+    def _hisparse_check_host_memory(
+        self, kv_cache_config, host_resident_layers: set[str]
+    ) -> None:
+        """Fail fast if the node cannot hold every rank's pinned host pool.
+
+        The pool is allocated per rank; every co-located rank (TP peers, DP
+        engines on the same node) pins its own copy, and hosts often run
+        co-tenants with large RAM appetites (CPU KV stores, RL
+        orchestrators). A partial cudaHostAlloc failure mid-startup or an
+        OOM-killed co-tenant is much harder to diagnose than this error.
+        """
+        import psutil
+
+        rank_bytes = sum(
+            t.size
+            for t in kv_cache_config.kv_cache_tensors
+            if all(name in host_resident_layers for name in t.shared_by)
+        )
+        parallel = self.vllm_config.parallel_config
+        # Conservative per-node rank count: TP peers x locally-hosted DP
+        # engines. Over-counts when TP spans nodes, which only makes the
+        # check stricter.
+        ranks_on_node = parallel.tensor_parallel_size * max(
+            parallel.data_parallel_size_local, 1
+        )
+        need = rank_bytes * ranks_on_node
+        avail = psutil.virtual_memory().available
+        if need > avail * 0.95:
+            raise ValueError(
+                f"HiSparse pinned host pools need ~{need / 2**30:.0f} GiB on "
+                f"this node ({ranks_on_node} ranks x "
+                f"{rank_bytes / 2**30:.0f} GiB) but only "
+                f"{avail / 2**30:.0f} GiB of RAM is available. Lower "
+                "hisparse_config.host_pool_gib or leave headroom for "
+                "co-tenants (KV stores, orchestrators)."
+            )
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -7134,6 +7171,8 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
         host_resident_layers = self._hisparse_host_resident_layers()
+        if host_resident_layers:
+            self._hisparse_check_host_memory(kv_cache_config, host_resident_layers)
         host_bytes = 0
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         packed_backing: torch.Tensor | None = None
