@@ -397,9 +397,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 self.nixl_wrapper.transfer(handle)
             except Exception:
                 # Handles not yet started can be released; already-started
-                # ones stay in _recving_transfers so _pop_done_transfers
-                # reaps them (the request is reported failed exactly once
-                # via _handle_failed_transfer in the caller).
+                # ones cannot be aborted, so they stay in _recving_transfers
+                # and _pop_done_transfers polls them to a terminal state.
+                # The request is reported failed exactly once, only after
+                # its last handle is terminal (see _handle_failed_transfer).
                 for unstarted in handles[i:]:
                     self.nixl_wrapper.release_xfer_handle(unstarted)
                 raise

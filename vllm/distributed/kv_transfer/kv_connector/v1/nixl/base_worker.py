@@ -443,9 +443,21 @@ class NixlBaseConnectorWorker:
         # only one xfer, so the P-side notification is sent explicitly once
         # every xfer of the request completes (see _pop_done_transfers).
         self._pending_recv_notifs: dict[ReqId, list[tuple[str, bytes]]] = {}
-        # Requests already reported failed whose remaining in-flight xfers
-        # must be reaped without re-reporting the request as done.
+        # Requests with a failed xfer whose sibling xfers are still in
+        # flight. A posted NIXL transfer cannot be aborted (on the UCX
+        # backend release_xfer_handle silently skips the cancel and the RDMA
+        # READ keeps writing into local memory after the call), so the
+        # failure report — and with it the scheduler's block invalidation
+        # and reuse — is deferred until _pop_done_transfers reaps the
+        # request's last handle. Reporting earlier lets the surviving READ
+        # DMA into blocks the scheduler has already reallocated.
+        self._failed_recv_pending: set[ReqId] = set()
+        # Requests reported failed and not yet drained by get_finished;
+        # guards exactly-once reporting.
         self._failed_recv_reported: set[ReqId] = set()
+        # Guards the failed-recv transitions against _recving_transfers
+        # state; shared with the background handshake thread.
+        self._failed_recv_lock = threading.Lock()
 
         # Handshake metadata of this worker for NIXL transfers.
         self.xfer_handshake_metadata: NixlHandshakePayload | None = None
@@ -1981,10 +1993,10 @@ class NixlBaseConnectorWorker:
             except queue.Empty:
                 break
 
-        # A failed request with no in-flight xfers left needs no reap guard.
-        for req_id in failed_recv_reqs:
-            if req_id not in self._recving_transfers:
-                self._failed_recv_reported.discard(req_id)
+        # Drained: a later request reusing the same id (abort + resubmit) is
+        # a distinct lifecycle and may fail again.
+        with self._failed_recv_lock:
+            self._failed_recv_reported.difference_update(failed_recv_reqs)
 
         # Add failed requests to done_recving for scheduler tracking
         # (blocks are already marked invalid, scheduler will handle recompute)
@@ -2115,36 +2127,51 @@ class NixlBaseConnectorWorker:
                         self.nixl_wrapper.release_xfer_handle(handle)
                     elif xfer_state == "PROC":
                         in_progress.append(handle)
-                        continue
                     else:
                         self._log_failure(
                             failure_type="transfer_failed",
-                            msg="Marking blocks as invalid",
+                            msg="Deferring the failure report until the "
+                            "request's last xfer is terminal",
                             req_id=req_id,
                             xfer_state=xfer_state,
                         )
-                        self._handle_failed_transfer(req_id, handle)
+                        # ERR is terminal: UCX stops hardware placement
+                        # before completing a request with error, so the
+                        # handle can be released — unlike PROC handles,
+                        # which cannot be aborted and must be polled until
+                        # terminal.
+                        self.nixl_wrapper.release_xfer_handle(handle)
+                        self.xfer_stats.record_failed_transfer()
+                        with self._failed_recv_lock:
+                            self._failed_recv_pending.add(req_id)
                 except Exception as e:
                     self._log_failure(
                         failure_type="transfer_exception",
-                        msg="Marking blocks as invalid",
+                        msg="Handle is unpollable; treating it as terminal",
                         req_id=req_id,
                         error=e,
                     )
-                    self._handle_failed_transfer(req_id, handle)
+                    # The handle leaks: releasing an unpollable handle can
+                    # itself throw, and there is nothing left to poll.
+                    self.xfer_stats.record_failed_transfer()
+                    with self._failed_recv_lock:
+                        self._failed_recv_pending.add(req_id)
 
-            if not in_progress:
-                del transfers[req_id]
-                if req_id in self._failed_recv_reported:
-                    # Already reported failed in a previous step; reap the
-                    # remaining handles without re-reporting the request.
-                    self._failed_recv_reported.discard(req_id)
+            with self._failed_recv_lock:
+                if in_progress:
+                    transfers[req_id] = in_progress
                     continue
-                # Only report request as completed when all transfers are done.
-                done_req_ids.add(req_id)
-                self._send_pending_recv_notifs(req_id)
-            else:
-                transfers[req_id] = in_progress
+                del transfers[req_id]
+                failed = req_id in self._failed_recv_pending
+                self._failed_recv_pending.discard(req_id)
+            if failed:
+                # Every xfer of this failed request is now terminal: no DMA
+                # can land after the scheduler frees its blocks.
+                self._report_failed_recv(req_id)
+                continue
+            # Only report request as completed when all transfers are done.
+            done_req_ids.add(req_id)
+            self._send_pending_recv_notifs(req_id)
         return done_req_ids
 
     def _send_pending_recv_notifs(self, req_id: str) -> None:
@@ -2168,26 +2195,47 @@ class NixlBaseConnectorWorker:
                 self.xfer_stats.record_failed_notification()
 
     def _handle_failed_transfer(self, req_id: str, handle: int | None):
-        """
-        Handle a failed transfer by marking all (logical) blocks as invalid and
-        recording the failure.
+        """Handle a transfer that failed before (or while) being posted.
+
+        ``handle`` may only be a handle that never started: a POSTED transfer
+        cannot be aborted (on the UCX backend release_xfer_handle silently
+        skips the cancel and the RDMA READ keeps writing into local memory),
+        so in-flight handles are instead polled to a terminal state by
+        _pop_done_transfers. When sibling xfers of this request are still in
+        flight, the failure report is deferred until the last one is reaped.
 
         Args:
             req_id: The request ID.
-            handle: The transfer handle.
+            handle: A never-started transfer handle to release, if any.
         """
+        if handle is not None:
+            self.nixl_wrapper.release_xfer_handle(handle)
+        self.xfer_stats.record_failed_transfer()
+        with self._failed_recv_lock:
+            if self._recving_transfers.get(req_id):
+                self._failed_recv_pending.add(req_id)
+                return
+            self._failed_recv_pending.discard(req_id)
+        self._report_failed_recv(req_id)
+
+    def _report_failed_recv(self, req_id: str) -> None:
+        """Report a failed recv exactly once, marking its blocks invalid.
+
+        Must only be called once none of the request's xfers remains in
+        flight: the scheduler frees and reuses the blocks in response.
+        """
+        with self._failed_recv_lock:
+            if req_id in self._failed_recv_reported:
+                return
+            self._failed_recv_reported.add(req_id)
         # Use .get() here as the metadata cleanup is handled by get_finished()
         # TODO (NickLucche) handle failed transfer for HMA.
         if (meta := self._recving_metadata.get(req_id)) and not self._is_hma_required:
             self._invalid_block_ids.put(set(meta.local_block_ids[0]))
         self._failed_recv_reqs.put(req_id)
-        self._failed_recv_reported.add(req_id)
         # Never notify P for a failed read; its blocks are freed on lease
         # expiry (the request is recovered on the D side).
         self._pending_recv_notifs.pop(req_id, None)
-        if handle is not None:
-            self.nixl_wrapper.release_xfer_handle(handle)
-        self.xfer_stats.record_failed_transfer()
 
     def _send_heartbeats(self, metadata: NixlConnectorMetadata) -> None:
         """
