@@ -1453,12 +1453,16 @@ def get_kv_cache_config_from_groups(
             # Derive the requirement from the spec so rounding and context-
             # parallel sharding cannot disagree with the fits()/admission
             # checks (max_memory_usage_bytes divides by dcp*pcp per rank).
+            # Skip when num_blocks was forced (num_gpu_blocks_override): the
+            # CUDA-graph profiling path builds a deliberately minimal config,
+            # and an explicit operator override owns its own sizing.
             group_spec = kv_cache_groups[0].kv_cache_spec
             max_len_blocks = cdiv(
                 group_spec.max_memory_usage_bytes(vllm_config),
                 group_spec.page_size_bytes,
             )
-            if max_len_blocks > num_blocks:
+            override = vllm_config.cache_config.num_gpu_blocks_override
+            if override is None and max_len_blocks > num_blocks:
                 raise ValueError(
                     "HiSparse host-resident KV cannot hold one max_model_len "
                     f"({vllm_config.model_config.max_model_len}) request: it "
