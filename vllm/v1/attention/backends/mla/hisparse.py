@@ -395,8 +395,12 @@ class HiSparseCoordinator:
         self.group_shared: list[HiSparseCoordinator] = []
         self.leader: HiSparseCoordinator | None = None
         self._prefetch_event: torch.cuda.Event | None = None
+        # Default on: measured +24% (c=32) / +41% (c=96) end-to-end decode
+        # throughput on GLM-5.2-FP8 vs inline gathers. Set
+        # VLLM_HISPARSE_OVERLAP=0 to fall back to inline gathers (e.g. if a
+        # driver/CUDA combination rejects the captured fork/join).
         self._overlap_enabled = (
-            os.environ.get("VLLM_HISPARSE_OVERLAP", "0") == "1"
+            os.environ.get("VLLM_HISPARSE_OVERLAP", "1") == "1"
             and self.device.type == "cuda"
             and _has_hisparse_ops()
         )
