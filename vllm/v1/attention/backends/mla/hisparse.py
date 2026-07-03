@@ -45,6 +45,17 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 
 logger = init_logger(__name__)
 
+# fp8_ds_mla KV row: 512 B quantized NoPE + 16 B scales + 128 B RoPE.
+FP8_DS_MLA_ROW_BYTES = 656
+
+# Hot regions are padded to a multiple of this so the flat hot buffer can be
+# viewed with any kernel page size up to 128.
+HOT_REGION_ALIGN = 128
+
+# Warn when the estimated hot-buffer footprint exceeds this fraction of total
+# GPU memory (model load will likely OOM).
+HOT_BUFFER_GPU_WARN_FRACTION = 0.5
+
 
 def is_hisparse_decode_batch(
     *,
@@ -126,13 +137,16 @@ class HiSparseConfig:
 
         max_num_seqs = scheduler_config.max_num_seqs
         num_layers = get_num_layers(vllm_config.parallel_config)
-        # fp8_ds_mla row (656 B) as the sizing estimate; bf16 rows are larger.
+        # fp8_ds_mla row as the sizing estimate; bf16 rows are larger.
         est_hot_bytes = (
-            num_layers * max_num_seqs * round_up(device_buffer_size + 1, 128) * 656
+            num_layers
+            * max_num_seqs
+            * round_up(device_buffer_size + 1, HOT_REGION_ALIGN)
+            * FP8_DS_MLA_ROW_BYTES
         )
         total_gpu = torch.cuda.get_device_properties(0).total_memory
-        if est_hot_bytes > 0.5 * total_gpu:
-            logger.warning(
+        if est_hot_bytes > HOT_BUFFER_GPU_WARN_FRACTION * total_gpu:
+            logger.warning_once(
                 "HiSparse hot buffers would need >= %.1f GiB of GPU memory "
                 "(%d layers x max_num_seqs=%d x device_buffer_size=%d). This "
                 "usually OOMs at model load; lower max_num_seqs on decode "
@@ -171,7 +185,8 @@ def get_num_real_reqs_tensor(device: torch.device) -> torch.Tensor:
     return tensor
 
 
-# Coordinators with live swap-in counters (full layers), for telemetry.
+# All coordinators register here for telemetry; only full (plan-producing)
+# layers' swap-in counters ever advance.
 _STATS: list["HiSparseCoordinator"] = []
 _STATS_INTERVAL = 2000
 _stats_calls = 0
@@ -218,6 +233,23 @@ def set_num_real_reqs(num_reqs: int) -> None:
     _maybe_log_hisparse_stats()
 
 
+def _leader_coordinators(
+    static_forward_context: dict,
+) -> list[HiSparseCoordinator]:
+    """Coordinators owning live hot-buffer state (dgi/lru).
+
+    Index-sharing "shared" layers replay their leader's plan and never write
+    dgi/lru, so per-block/per-row state maintenance skips them.
+    """
+    return [
+        coordinator
+        for layer in static_forward_context.values()
+        if (coordinator := getattr(getattr(layer, "impl", None),
+                                   "hisparse_coordinator", None)) is not None
+        and coordinator.leader is None
+    ]
+
+
 def invalidate_blocks(
     static_forward_context: dict, block_ids: list[int], block_size: int
 ) -> None:
@@ -231,16 +263,7 @@ def invalidate_blocks(
     if not block_ids:
         return
     slots: torch.Tensor | None = None
-    for layer in static_forward_context.values():
-        impl = getattr(layer, "impl", None)
-        coordinator = getattr(impl, "hisparse_coordinator", None)
-        if coordinator is None:
-            continue
-        if coordinator.leader is not None:
-            # Index-sharing "shared" layer: its dgi/lru are never written
-            # (apply_plan replays the leader's plan), so there is nothing
-            # to invalidate.
-            continue
+    for coordinator in _leader_coordinators(static_forward_context):
         if slots is None:
             blocks = torch.tensor(
                 block_ids, dtype=torch.long, device=coordinator.device
@@ -257,14 +280,7 @@ def reset_rows(static_forward_context: dict, row_ids: list[int]) -> None:
     if not row_ids:
         return
     rows: torch.Tensor | None = None
-    for layer in static_forward_context.values():
-        impl = getattr(layer, "impl", None)
-        coordinator = getattr(impl, "hisparse_coordinator", None)
-        if coordinator is None:
-            continue
-        if coordinator.leader is not None:
-            # Shared layers carry no live dgi/lru state (see invalidate_blocks).
-            continue
+    for coordinator in _leader_coordinators(static_forward_context):
         if rows is None:
             rows = torch.tensor(row_ids, dtype=torch.long, device=coordinator.device)
         coordinator.reset_hot_rows(rows)
@@ -288,21 +304,15 @@ def warm_start_requests(
     """
     if not row_ids:
         return
-    leaders = [
-        coordinator
-        for layer in static_forward_context.values()
-        if (coordinator := getattr(getattr(layer, "impl", None),
-                                   "hisparse_coordinator", None)) is not None
-        and coordinator.leader is None
-    ]
+    leaders = _leader_coordinators(static_forward_context)
     if not leaders or not leaders[0].config.warm_start:
         return
     device = leaders[0].device
-    dbs = leaders[0].config.device_buffer_size
+    buf = leaders[0].config.device_buffer_size
 
     slot_lists: list[list[int]] = []
     for block_ids, num_computed in contexts:
-        n = min(dbs, num_computed)
+        n = min(buf, num_computed)
         slot_lists.append(
             [
                 block_ids[t // block_size] * block_size + t % block_size
@@ -402,8 +412,8 @@ _COPY_STREAMS: dict[str, "torch.cuda.Stream"] = {}
 
 def _get_copy_stream(device: torch.device) -> "torch.cuda.Stream":
     """One dedicated copy stream per device, shared across a group's coordinators
-    for overlapped prefetch (#1). Capturing a fork/join around work on it into a
-    FULL_DECODE_ONLY graph is supported (verified by the capture spike)."""
+    for overlapped prefetch. Capturing a fork/join around work on it into a
+    FULL_DECODE_ONLY graph is supported."""
     key = str(device)
     s = _COPY_STREAMS.get(key)
     if s is None:
@@ -435,11 +445,10 @@ class HiSparseCoordinator:
         self.row_width = row_width
         self.kv_dtype = kv_dtype
         self.device = torch.device(device)
-        # One reserved slot for the newest token, padded so the flat hot
-        # buffer can be viewed with any kernel page size up to 128 (the
-        # FlashMLA FP8 / FlashInfer sparse kernels need a paged layout; the
-        # actual block size is only known at swap-in time).
-        self.region_stride = round_up(config.device_buffer_size + 1, 128)
+        # One reserved slot for the newest token; the FlashMLA FP8 sparse
+        # kernel needs a paged layout and the actual block size is only known
+        # at swap-in time, hence the alignment padding.
+        self.region_stride = round_up(config.device_buffer_size + 1, HOT_REGION_ALIGN)
 
         row_bytes = row_width * kv_dtype.itemsize
         if row_bytes % 16 != 0:
@@ -482,7 +491,7 @@ class HiSparseCoordinator:
         # Group-shared plan buffers for index-sharing plan-once (see _GroupPlan).
         self._plan = _get_group_plan(self.device, max_num_reqs, config.top_k)
 
-        # Overlapped prefetch (#1, opt-in): a "full" layer issues its group's
+        # Overlapped prefetch: a "full" layer issues its group's
         # "shared" gathers early on a copy stream, overlapping the PCIe transfer
         # with intervening compute. group_shared/leader are wired by the impl
         # (which knows full vs shared); _prefetch_event is recorded on the copy
@@ -513,7 +522,7 @@ class HiSparseCoordinator:
         # backup stream). The decode KV-update (write_newest_rows -> _backup_rows)
         # executes inside the FULL_DECODE_ONLY CUDA graph; a cross-stream wait
         # there raises "dependency created on uncaptured work in another stream"
-        # and aborts graph capture (the bug that previously forced enforce_eager).
+        # and aborts graph capture.
         # Running the backup on the capture stream is graph-safe, and the
         # per-step decode backup is only the batch's newest rows (tiny), so
         # there is no overlap worth reclaiming. (SGLang overlaps its backup by
@@ -1000,7 +1009,7 @@ class HiSparseCoordinator:
         if produce_plan:
             # Shared layers reuse the group's counts (identical top-k).
             self._plan.valid_counts = valid_counts
-            # Overlap (#1): issue the group's shared gathers early on the copy
+            # Overlapped prefetch: issue the group's shared gathers early on the copy
             # stream so their PCIe transfer overlaps intervening compute.
             if self._overlap_enabled and self.group_shared:
                 self._prefetch_group(num_tokens)
@@ -1036,7 +1045,7 @@ class HiSparseCoordinator:
         """Leader-side: fork the copy stream from the compute stream (plan is
         ready) and issue each shared layer's gather on it, recording a per-shared
         event the shared layer's apply_plan awaits. Fork here + wait_event there
-        is captured into the decode graph (verified by the capture spike)."""
+        is captured into the decode graph."""
         compute = torch.cuda.current_stream(self.device)
         self._copy_stream.wait_stream(compute)  # fork
         with torch.cuda.stream(self._copy_stream):
@@ -1241,10 +1250,10 @@ def create_hisparse_coordinator(
     if config is None:
         return None
 
-    # HiSparse is decode-only: intended for PD decode instances, where KV
-    # arrives via a consumer connector (NIXL) into the host pool and the
-    # instance never prefills locally. The unified / non-PD prefill-from-host
-    # path has been removed (do_kv_cache_update asserts a decode batch).
+    # HiSparse targets PD decode instances, where KV arrives via a consumer
+    # connector (NIXL) into the host pool. Local prefill (preemption resume,
+    # recompute after a failed KV load) is supported but stages context
+    # host->GPU, so it is slower than a normal GPU prefill.
     hf_config = vllm_config.model_config.hf_config
     if not hasattr(hf_config, "index_topk"):
         raise ValueError("HiSparse is only supported for DSA models with index_topk.")
@@ -1267,7 +1276,7 @@ def create_hisparse_coordinator(
     hot_bytes = coordinator.hot_cache.numel() * kv_dtype.itemsize
     logger.info_once(
         "Enabled experimental HiSparse sparse MLA hot buffer: top_k=%d, "
-        "device_buffer_size=%d (region_stride=%d), host_to_device_ratio=%d, "
+        "device_buffer_size=%d (region_stride=%d), host_to_device_ratio=%s, "
         "host_pool_gib=%s, %.1f MiB GPU hot buffer per layer "
         "(max_num_seqs=%d).",
         config.top_k,

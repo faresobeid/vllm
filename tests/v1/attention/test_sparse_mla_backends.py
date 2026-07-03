@@ -1289,7 +1289,7 @@ def test_hisparse_kernel_matches_fallback():
 def test_hisparse_plan_once_matches_independent():
     """GLM-5.2 index sharing: a "shared" layer that replays the "full" layer's
     plan via apply_plan must produce the same hot buffer as if it had run
-    swap_in independently. Covers the new hisparse_gather_plan kernel + the
+    swap_in independently. Covers the hisparse_gather_plan kernel + the
     miss_mask plan output, on both the kernel and Python-reference paths.
     """
     from vllm.v1.attention.backends.mla import hisparse as _hs
@@ -1342,7 +1342,9 @@ def test_hisparse_plan_once_matches_independent():
                 slot_mapping=slot_mapping,
             )
             # full layer produces the plan; independent layer resolves alone.
-            _, idx_full = producer.swap_in(topk_indices=topk.clone(), produce_plan=True, **kw)
+            _, idx_full = producer.swap_in(
+                topk_indices=topk.clone(), produce_plan=True, **kw
+            )
             _, idx_indep = indep.swap_in(topk_indices=topk.clone(), **kw)
             # shared layer replays the plan (no LRU resolution of its own).
             _, idx_shared = shared.apply_plan(
@@ -1360,10 +1362,10 @@ def test_hisparse_plan_once_matches_independent():
 
 
 def test_hisparse_overlap_prefetch_matches_independent():
-    """Overlapped prefetch (#1): a full layer prefetching its shared layers'
+    """Overlapped prefetch: a full layer prefetching its shared layers'
     gathers on the copy stream yields the same hot buffers as independent
     per-layer swap_in. Validates the copy-stream fork + per-shared event sync +
-    correctness (eager; capture-safety is covered by the capture spike + e2e).
+    correctness in eager mode; graph-capture safety is exercised end-to-end.
     """
     from vllm.v1.attention.backends.mla import hisparse as _hs
 
@@ -1420,10 +1422,6 @@ def test_hisparse_overlap_prefetch_matches_independent():
         torch.testing.assert_close(s2.hot_cache, i2.hot_cache)
 
 
-@pytest.mark.skipif(
-    not _has_hisparse_ops(),
-    reason="HiSparse host-resident mode requires compiled CUDA ops",
-)
 @pytest.mark.skipif(
     not _has_hisparse_ops(),
     reason="HiSparse host-resident mode requires compiled CUDA ops",
@@ -1595,7 +1593,6 @@ def test_hisparse_warm_start_rows():
     coordinator = _make_hisparse_coordinator()
     if not coordinator._use_cuda_ops:
         pytest.skip("warm start requires the HiSparse CUDA ops")
-    buf = coordinator.config.device_buffer_size
     stride = coordinator.region_stride
     coordinator.bind_source_cache(kv_pool)
     assert coordinator.source_is_host

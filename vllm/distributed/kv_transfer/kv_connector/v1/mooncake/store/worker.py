@@ -966,7 +966,7 @@ class MooncakeStoreWorker:
         # HiSparse keeps MLA KV in pinned host memory while the indexer KV
         # stays on the GPU, so the connector must register and address a mix of
         # host and device segments. ``enable_hisparse`` implies the
-        # host-resident path (the public ``host_resident`` knob was removed).
+        # host-resident path.
         attention_config = getattr(vllm_config, "attention_config", None)
         self._hisparse_enabled = bool(
             attention_config is not None

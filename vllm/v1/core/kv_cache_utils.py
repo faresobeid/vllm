@@ -1337,9 +1337,7 @@ def _hisparse_host_pool_bytes(
 
     NOTE: the resulting block count is still capped by the GPU indexer budget in
     ``get_kv_cache_config_from_groups`` (a single shared ``num_blocks``), so for
-    large host pools prefer ``host_pool_gib``. SGLang avoids this cap with
-    separate host/device paged allocators + an index map; fully decoupling the
-    fork's host/device block counts is the remaining alignment gap.
+    large host pools prefer ``host_pool_gib``.
     """
     from vllm.v1.attention.backends.mla.hisparse import HiSparseConfig
 

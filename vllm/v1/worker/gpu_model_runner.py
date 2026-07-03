@@ -7199,7 +7199,7 @@ class GPUModelRunner(
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         packed_backing: torch.Tensor | None = None
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            if bool(host_resident_layers) and all(
+            if host_resident_layers and all(
                 name in host_resident_layers for name in kv_cache_tensor.shared_by
             ):
                 # empty, not zeros: zero-filling a pinned pool of this size is

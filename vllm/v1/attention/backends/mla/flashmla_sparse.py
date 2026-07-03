@@ -32,6 +32,7 @@ from vllm.v1.attention.backend import (
     SparseMLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.hisparse import (
+    FP8_DS_MLA_ROW_BYTES,
     HiSparseCoordinator,
     create_hisparse_coordinator,
     is_hisparse_decode_batch,
@@ -59,7 +60,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Overlap (#1) group wiring: the coordinator of the most-recently-constructed
+# Overlap group wiring: the coordinator of the most-recently-constructed
 # "full" layer, so the shared layers that follow can attach to it. Per-process
 # (one model per vLLM process); reset implicitly as each full layer is built.
 _HISPARSE_CURRENT_LEADER = None
@@ -596,7 +597,8 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         attention_config = get_current_vllm_config().attention_config
         if attention_config is not None and attention_config.enable_hisparse:
             if kv_cache_dtype == "fp8_ds_mla":
-                hisparse_row_width, hisparse_kv_dtype = 656, torch.uint8
+                hisparse_row_width = FP8_DS_MLA_ROW_BYTES
+                hisparse_kv_dtype = torch.uint8
             else:
                 hisparse_row_width = head_size
                 hisparse_kv_dtype = kv_cache_dtype_str_to_dtype(
@@ -625,7 +627,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 # Wire the overlap group in layer-construction order: a full
                 # layer becomes the current leader; the shared layers that
                 # follow (until the next full layer) attach to it. Overlapped
-                # prefetch (#1) uses these refs; harmless when overlap is off.
+                # prefetch uses these refs; harmless when overlap is off.
                 if self._hisparse_index_sharing:
                     global _HISPARSE_CURRENT_LEADER
                     if self._hisparse_is_full_layer:
