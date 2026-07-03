@@ -108,10 +108,24 @@ class HiSparseConfig:
         # max_num_seqs; a too-large default (e.g. 1024 seqs on GLM-5.2 at
         # dbs=4096: ~2.7 MB/req/layer -> ~170 GB/rank) otherwise surfaces as
         # an unrelated CUDA OOM at load time (DeepEP buffers, weights, ...).
-        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        num_layers = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config
-        )
+        # Advisory only: skip on stub configs (tests) or CPU-only hosts.
+        get_num_layers = getattr(vllm_config.model_config, "get_num_layers", None)
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        if (
+            get_num_layers is None
+            or scheduler_config is None
+            or not torch.cuda.is_available()
+        ):
+            return cls(
+                top_k=top_k,
+                device_buffer_size=device_buffer_size,
+                host_to_device_ratio=host_to_device_ratio,
+                host_pool_gib=host_pool_gib,
+                warm_start=warm_start,
+            )
+
+        max_num_seqs = scheduler_config.max_num_seqs
+        num_layers = get_num_layers(vllm_config.parallel_config)
         # fp8_ds_mla row (656 B) as the sizing estimate; bf16 rows are larger.
         est_hot_bytes = (
             num_layers * max_num_seqs * round_up(device_buffer_size + 1, 128) * 656
