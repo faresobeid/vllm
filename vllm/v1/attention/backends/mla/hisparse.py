@@ -629,6 +629,64 @@ class HiSparseCoordinator:
         # (new, resumed, or growing) before the step that first writes it,
         # so no per-step in-graph invalidation is needed here.
 
+    def write_rows_to_host(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+    ) -> None:
+        """Write prefill/mixed-batch rows directly to a host-resident pool.
+
+        Local prefill on a decode instance (router shortcut, preemption
+        resume, recompute after a failed KV load): quantize the rows on GPU,
+        then scatter them to their global host slots via the backup kernel.
+        Recycled-slot hygiene is handled at block-assignment time by the
+        model runner, so no hot-copy invalidation is needed here.
+        """
+        from vllm import _custom_ops as ops
+
+        if kv_cache.numel() == 0:
+            return
+        self.bind_source_cache(kv_cache)
+        if not self._source_is_host:
+            raise RuntimeError("write_rows_to_host requires a host-resident KV pool.")
+        flat_slots = slot_mapping.flatten()[: kv_c_normed.shape[0]]
+        valid_mask = flat_slots >= 0
+        valid = flat_slots[valid_mask].to(device=self.device, dtype=torch.int64)
+        if valid.numel() == 0:
+            return
+        # CUDA graph padding can make kv_c_normed/k_pe longer than slot_mapping.
+        # Only rows represented by slot_mapping correspond to real KV writes.
+        real_kv_rows = kv_c_normed[: flat_slots.numel()]
+        real_pe_rows = k_pe[: flat_slots.numel()]
+
+        if kv_cache_dtype == "fp8_ds_mla":
+            kv_rows = real_kv_rows[valid_mask]
+            pe_rows = real_pe_rows[valid_mask]
+            rows = torch.empty(
+                (valid.numel(), self.row_width),
+                dtype=self.kv_dtype,
+                device=self.device,
+            )
+            ops.concat_and_cache_mla(
+                kv_rows,
+                pe_rows.squeeze(1),
+                rows.view(-1, 1, self.row_width),
+                torch.arange(valid.numel(), dtype=torch.int64, device=self.device),
+                kv_cache_dtype=kv_cache_dtype,
+                scale=k_scale,
+            )
+        else:
+            rows = torch.cat(
+                [real_kv_rows[valid_mask], real_pe_rows[valid_mask].squeeze(1)],
+                dim=-1,
+            ).contiguous()
+        src = torch.arange(valid.numel(), dtype=torch.int64, device=self.device)
+        self._backup_rows(rows, src, valid)
+
     # ---------------------------------------------------------------- swap-in
 
     def swap_in(
@@ -639,7 +697,7 @@ class HiSparseCoordinator:
         block_table: torch.Tensor,
         topk_indices: torch.Tensor,
         block_size: int,
-        slot_mapping: torch.Tensor,
+        slot_mapping: torch.Tensor | None,
         return_valid_counts: bool = False,
         produce_plan: bool = False,
     ) -> (
@@ -688,7 +746,15 @@ class HiSparseCoordinator:
 
         # Newest tokens resolve to the reserved hot slot the KV update wrote
         # this step, keyed by their global slot id from the slot mapping.
-        newest_global = slot_mapping[:num_tokens].to(torch.int32).contiguous()
+        # When slot_mapping is None (mixed batches: the newest rows were
+        # written to the host pool, not the reserved hot slots), newest
+        # tokens are resolved like any other entry (miss -> host load); the
+        # backup kernel runs stream-ordered, so those rows are visible.
+        newest_global = (
+            slot_mapping[:num_tokens].to(torch.int32).contiguous()
+            if slot_mapping is not None
+            else None
+        )
 
         # For a plan producer, resolve into the group-shared buffers so the
         # group's shared layers can replay the identical plan.

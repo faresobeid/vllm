@@ -707,10 +707,12 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         kv_c_and_k_pe_cache: torch.Tensor,
         topk_indices: torch.Tensor,
         attn_metadata: FlashMLASparseMetadata,
+        num_decode_tokens: int | None = None,
         return_valid_counts: bool = False,
     ):
         assert self.hisparse_coordinator is not None
-        n = topk_indices.shape[0]
+        pure_decode = num_decode_tokens is None
+        n = topk_indices.shape[0] if pure_decode else num_decode_tokens
         # Index-sharing "shared" layer: replay the group's plan (produced by the
         # "full" layer's swap_in earlier this pass) instead of re-resolving LRU.
         if self._hisparse_index_sharing and not self._hisparse_is_full_layer:
@@ -724,12 +726,34 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             kv_cache=kv_c_and_k_pe_cache,
             req_id_per_token=attn_metadata.req_id_per_token[:n],
             block_table=attn_metadata.block_table,
-            topk_indices=topk_indices,
+            topk_indices=topk_indices[:n],
             block_size=attn_metadata.block_size,
-            slot_mapping=attn_metadata.slot_mapping,
+            slot_mapping=attn_metadata.slot_mapping if pure_decode else None,
             return_valid_counts=return_valid_counts,
             produce_plan=self._hisparse_index_sharing,
         )
+
+    def _hisparse_host_prefill_cache(
+        self,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stage the batch's blocks from the host pool into a GPU cache.
+
+        Local prefill on a host-resident instance: sparse prefill attention
+        needs the context on GPU, so gather the block table's rows host->GPU
+        and renumber the block table against the staged copy. The backup
+        kernel is stream-ordered, so freshly written host rows are visible.
+        """
+        num_b, max_blocks = block_table.shape
+        flat_ids = block_table.to(device="cpu", dtype=torch.long).clamp_(min=0)
+        staged = kv_c_and_k_pe_cache[flat_ids.flatten()].to(
+            device=block_table.device, non_blocking=True
+        )
+        new_bt = torch.arange(
+            num_b * max_blocks, dtype=torch.int32, device=block_table.device
+        ).view(num_b, max_blocks)
+        return staged, new_bt
 
     def do_kv_cache_update(
         self,
@@ -753,19 +777,35 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         if self._hisparse_dummy_batch:
             # Dummy run: nothing to write (slot mapping is all -1).
             return
-        # HiSparse is decode-only: on a PD decode instance KV arrives via NIXL
-        # into the host pool, so there is no local prefill to write/mirror to
-        # host. Write only the batch's newest rows into the hot buffer.
+
         if not self._hisparse_decode_batch:
-            raise RuntimeError(
-                "HiSparse is decode-only but this instance received a "
-                "prefill/mixed batch. This happens when a request prefills "
-                "locally on a decode instance: preemption-resume under "
-                "memory pressure, kv_load_failure_policy='recompute', or a "
-                "router that sends short prompts straight to decode "
-                "instances. Route all prefills to prefill instances and "
-                "size the host pool to avoid preemption."
+            # Local prefill on this instance (router shortcut for short
+            # suffixes, preemption resume, recompute after a failed KV
+            # load): write the rows straight to the host pool (or to the
+            # GPU cache + mirror in mirror mode). Slower than PD prefill;
+            # correct either way.
+            self.hisparse_coordinator.bind_source_cache(kv_cache)
+            if self.hisparse_coordinator.source_is_host:
+                self.hisparse_coordinator.write_rows_to_host(
+                    kv_c_normed,
+                    k_pe,
+                    kv_cache,
+                    slot_mapping,
+                    kv_cache_dtype,
+                    k_scale,
+                )
+                return
+            super().do_kv_cache_update(
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                slot_mapping,
+                kv_cache_dtype,
+                k_scale,
             )
+            self.hisparse_coordinator.mirror_slots(kv_cache, slot_mapping)
+            return
+
         self.hisparse_coordinator.write_newest_rows(
             kv_c_normed,
             k_pe,
@@ -797,6 +837,12 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             )
 
         block_table = attn_metadata.block_table
+        if kv_c_and_k_pe_cache.device.type == "cpu":
+            # Host-resident pool + local prefill: stage the context on GPU.
+            kv_c_and_k_pe_cache, block_table = self._hisparse_host_prefill_cache(
+                kv_c_and_k_pe_cache,
+                block_table,
+            )
 
         # Convert per-request indices to global slots (decode) or workspace
         # offsets (prefill).
@@ -831,13 +877,15 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
 
         decode_cache = kv_c_and_k_pe_cache
         decode_topk: torch.Tensor | None = None
-        if self._is_hisparse_decode(attn_metadata, attn_metadata.num_actual_tokens):
-            # HiSparse only ever sees pure decode batches: a batch with
-            # prefill tokens raised in do_kv_cache_update before attention.
+        use_hisparse = self.hisparse_coordinator is not None
+        if use_hisparse and num_decode_tokens > 0:
             decode_cache, decode_topk = self._hisparse_swap_in(
                 kv_c_and_k_pe_cache,
                 topk_indices,
                 attn_metadata,
+                num_decode_tokens=(
+                    None if num_prefill_tokens == 0 else num_decode_tokens
+                ),
             )
 
         prefill_request_ids = None
@@ -855,7 +903,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         # prefill_workspace_starts has been adjusted in-place per chunk so
         # prefill indices automatically come out chunk-local
         topk_length = None
-        if decode_topk is None:
+        if num_prefill_tokens > 0 or not use_hisparse:
             topk_indices, topk_length = triton_convert_req_index_to_global_index(
                 attn_metadata.req_id_per_token,
                 attn_metadata.block_table,
@@ -915,12 +963,19 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 )
 
             assert fp8_metadata.prefill is not None
+            host_resident = use_hisparse and kv_c_and_k_pe_cache.device.type == "cpu"
             for chunk in fp8_metadata.prefill.chunks:
                 chunk_workspace = self.prefill_bf16_workspace[: chunk.chunk_tot_seqlen]
+                if host_resident:
+                    gather_cache, gather_bt = self._hisparse_host_prefill_cache(
+                        kv_c_and_k_pe_cache, chunk.block_table
+                    )
+                else:
+                    gather_cache, gather_bt = kv_c_and_k_pe_cache, chunk.block_table
                 ops.cp_gather_and_upconvert_fp8_kv_cache(
-                    kv_c_and_k_pe_cache,
+                    gather_cache,
                     chunk_workspace,
-                    chunk.block_table,
+                    gather_bt,
                     chunk.seq_lens,
                     chunk.workspace_starts,
                     len(chunk.block_table),
@@ -974,6 +1029,12 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             return _attn_out.squeeze(0)
 
         block_table = attn_metadata.block_table
+        if kv_c_and_k_pe_cache.device.type == "cpu":
+            # Host-resident pool + local prefill: stage the context on GPU.
+            kv_c_and_k_pe_cache, block_table = self._hisparse_host_prefill_cache(
+                kv_c_and_k_pe_cache,
+                block_table,
+            )
 
         # Convert per-request indices to global slots (decode) or workspace
         # offsets (prefill).

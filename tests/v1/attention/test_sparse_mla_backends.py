@@ -1424,6 +1424,73 @@ def test_hisparse_overlap_prefetch_matches_independent():
     not _has_hisparse_ops(),
     reason="HiSparse host-resident mode requires compiled CUDA ops",
 )
+@pytest.mark.skipif(
+    not _has_hisparse_ops(),
+    reason="HiSparse host-resident mode requires compiled CUDA ops",
+)
+def test_hisparse_host_resident_prefill_write_rows():
+    device = torch.device(DEVICE_TYPE)
+    block_size = 4
+    row_width = 8
+    num_blocks = 8
+    kv_pool = torch.zeros(
+        num_blocks, block_size, row_width, dtype=torch.float32
+    ).pin_memory()
+    flat_pool = kv_pool.reshape(-1, row_width)
+    coordinator = _make_hisparse_coordinator(row_width=row_width)
+
+    slots = torch.tensor([3, 7, -1], dtype=torch.int64, device=device)
+    kv_c = torch.randn(3, row_width - 2, device=device)
+    k_pe = torch.randn(3, 1, 2, device=device)
+
+    coordinator.write_rows_to_host(
+        kv_c,
+        k_pe,
+        kv_pool,
+        slots,
+        "auto",
+        torch.tensor(1.0, device=device),
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.cat([kv_c[:2], k_pe[:2, 0]], dim=-1).cpu()
+    torch.testing.assert_close(flat_pool[torch.tensor([3, 7])], expected)
+
+
+@pytest.mark.skipif(
+    not _has_hisparse_ops(),
+    reason="HiSparse host-resident mode requires compiled CUDA ops",
+)
+def test_hisparse_host_resident_prefill_write_rows_with_padding():
+    device = torch.device(DEVICE_TYPE)
+    block_size = 4
+    row_width = 8
+    kv_pool = torch.zeros(
+        8, block_size, row_width, dtype=torch.float32
+    ).pin_memory()
+    flat_pool = kv_pool.reshape(-1, row_width)
+    coordinator = _make_hisparse_coordinator(row_width=row_width)
+
+    # CUDA graph padding can make the KV tensors longer than slot_mapping.
+    slots = torch.tensor([3, 7, -1], dtype=torch.int64, device=device)
+    kv_c = torch.randn(8, row_width - 2, device=device)
+    k_pe = torch.randn(8, 1, 2, device=device)
+
+    coordinator.write_rows_to_host(
+        kv_c,
+        k_pe,
+        kv_pool,
+        slots,
+        "auto",
+        torch.tensor(1.0, device=device),
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.cat([kv_c[:2], k_pe[:2, 0]], dim=-1).cpu()
+    torch.testing.assert_close(flat_pool[torch.tensor([3, 7])], expected)
+    torch.testing.assert_close(flat_pool[8], torch.zeros(row_width))
+
+
 def test_hisparse_host_resident_pool():
     """Host-resident mode: the pinned KV pool is the only full-size store."""
     device = torch.device(DEVICE_TYPE)

@@ -1173,24 +1173,21 @@ class VllmConfig:
             self.attention_config is not None
             and self.attention_config.enable_hisparse
         ):
-            # HiSparse is decode-only: the prefill-from-host path was removed,
-            # so any local prefill on a HiSparse instance fails mid-forward.
-            # Reject deployments that would prefill locally.
+            # PD-decode instances (KV arrives via a consumer connector) are
+            # the intended fast path. Local prefill also works — rows are
+            # written to the host pool and prefill attention stages the
+            # context host->GPU — but it is slower than a normal GPU prefill,
+            # so warn when the deployment will prefill routinely.
             if (
                 self.kv_transfer_config is None
                 or not self.kv_transfer_config.is_kv_consumer
             ):
-                raise ValueError(
-                    "HiSparse is decode-only and requires a kv_consumer "
-                    "connector (PD decode instance); a unified / non-PD "
-                    "instance would prefill locally, which HiSparse does not "
-                    "support."
-                )
-            if self.kv_transfer_config.kv_load_failure_policy == "recompute":
-                raise ValueError(
-                    "HiSparse is decode-only and cannot recompute failed KV "
-                    "loads (local prefill is unsupported); set "
-                    "kv_load_failure_policy='fail'."
+                logger.warning(
+                    "HiSparse host-resident KV is enabled without a "
+                    "kv_consumer connector (unified / non-PD instance). "
+                    "Every prefill gathers KV from host memory, which is "
+                    "slower than a normal GPU prefill; PD decode-only "
+                    "instances avoid this cost."
                 )
             if self.parallel_config.use_ubatching:
                 raise ValueError(
@@ -1198,11 +1195,14 @@ class VllmConfig:
                     "would index the same hot-buffer rows concurrently and "
                     "corrupt the LRU state."
                 )
-            if self.kv_transfer_config.kv_connector not in (
-                None,
-                "NixlConnector",
-                "MooncakeStoreConnector",
-                "MultiConnector",
+            if self.kv_transfer_config is not None and (
+                self.kv_transfer_config.kv_connector
+                not in (
+                    None,
+                    "NixlConnector",
+                    "MooncakeStoreConnector",
+                    "MultiConnector",
+                )
             ):
                 logger.warning(
                     "HiSparse host-resident KV is configured with connector "
