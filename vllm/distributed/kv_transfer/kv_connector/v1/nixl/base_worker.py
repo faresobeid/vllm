@@ -2017,7 +2017,18 @@ class NixlBaseConnectorWorker:
         for req_id in done_recving:
             # clean up metadata for completed requests
             meta = self._recving_metadata.pop(req_id, None)
-            assert meta is not None, f"{req_id} not found in recving_metadata list"
+            if meta is None:
+                # Late duplicate of an already-reaped request: a posted RDMA
+                # handle cannot be aborted, so a sibling transfer of a request
+                # that already failed (e.g. remote disconnect) reaches its
+                # terminal state in a later poll cycle and re-enters
+                # done_recving after the failure report cleared the metadata.
+                # Nothing is left to post-process; the scheduler tolerates the
+                # duplicate finished notification.
+                logger.debug(
+                    "Skipping late duplicate completion for request %s", req_id
+                )
+                continue
 
             # Skip KV sync and post-processing for failed requests
             if req_id in failed_recv_reqs:
