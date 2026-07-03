@@ -65,6 +65,35 @@ logger = init_logger(__name__)
 # (one model per vLLM process); reset implicitly as each full layer is built.
 _HISPARSE_CURRENT_LEADER = None
 
+# Layer-invariant local-prefill staging remap shared by every layer in the
+# forward: single slot keyed by (data_ptr, shape, _version) of the block
+# table, so layers 2..N of a step hit and any in-place table mutation (which
+# bumps _version) invalidates. Local prefill never runs under graph capture,
+# so table contents always change through version-bumping host-side writes.
+_HISPARSE_PREFILL_REMAP: tuple | None = None
+
+
+def hisparse_prefill_staging_remap(
+    block_table: torch.Tensor, block_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compact a block table onto its unique referenced blocks.
+
+    Returns ``(new_bt, row_ids)``: ``new_bt`` renumbers the table against a
+    staged copy holding only the unique blocks (``-1`` padding clamps to
+    block 0, which consumers never read past ``seq_len``), and ``row_ids``
+    is the ``[1, n_unique * block_size]`` int32 host-pool row ids to stage,
+    in staged order.
+    """
+    unique_ids, inverse = torch.unique(
+        block_table.clamp(min=0), return_inverse=True
+    )
+    new_bt = inverse.to(torch.int32)
+    row_ids = (
+        unique_ids.to(torch.int32).unsqueeze(1) * block_size
+        + torch.arange(block_size, dtype=torch.int32, device=block_table.device)
+    ).view(1, -1)
+    return new_bt, row_ids
+
 # For FP8 sparse attention we have two implementations:
 # 1. Mixed batch mode: use the FP8 decode kernel for both prefill and decode this is
 #    done by treating all tokens as single batch.
@@ -745,21 +774,67 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         kv_c_and_k_pe_cache: torch.Tensor,
         block_table: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Stage the batch's blocks from the host pool into a GPU cache.
+        """Stage the referenced context blocks from the host pool onto GPU.
 
         Local prefill on a host-resident instance: sparse prefill attention
-        needs the context on GPU, so gather the block table's rows host->GPU
-        and renumber the block table against the staged copy. The backup
-        kernel is stream-ordered, so freshly written host rows are visible.
+        needs the context on GPU, so gather the block table's unique
+        referenced blocks host->GPU and renumber the table against the
+        staged copy. The backup kernel is stream-ordered, so freshly written
+        host rows are visible. The gather reads the pinned pool directly on
+        the GPU (hisparse_gather_plan) instead of CPU-indexing the whole
+        padded table, and the index remap — identical for every layer — is
+        cached per (block table identity, mutation version).
         """
-        num_b, max_blocks = block_table.shape
-        flat_ids = block_table.to(device="cpu", dtype=torch.long).clamp_(min=0)
-        staged = kv_c_and_k_pe_cache[flat_ids.flatten()].to(
-            device=block_table.device, non_blocking=True
+        coordinator = self.hisparse_coordinator
+        assert coordinator is not None
+        device = block_table.device
+        if not coordinator._use_cuda_ops or coordinator._host_cache_valid is None:
+            # Python reference path (kernels unavailable): CPU-index the pool.
+            num_b, max_blocks = block_table.shape
+            flat_ids = block_table.to(device="cpu", dtype=torch.long).clamp_(min=0)
+            staged = kv_c_and_k_pe_cache[flat_ids.flatten()].to(
+                device=device, non_blocking=True
+            )
+            new_bt = torch.arange(
+                num_b * max_blocks, dtype=torch.int32, device=device
+            ).view(num_b, max_blocks)
+            return staged, new_bt
+
+        global _HISPARSE_PREFILL_REMAP
+        block_size = kv_c_and_k_pe_cache.shape[1]
+        row_width = kv_c_and_k_pe_cache.shape[-1]
+        key = (block_table.data_ptr(), block_table.shape, block_table._version)
+        cached = _HISPARSE_PREFILL_REMAP
+        if cached is not None and cached[0] == key:
+            _, new_bt, row_ids, dst_rows, miss_mask = cached
+        else:
+            new_bt, row_ids = hisparse_prefill_staging_remap(
+                block_table, block_size
+            )
+            dst_rows = torch.arange(
+                row_ids.shape[1], dtype=torch.int32, device=device
+            ).view(1, -1)
+            miss_mask = torch.ones_like(row_ids)
+            _HISPARSE_PREFILL_REMAP = (key, new_bt, row_ids, dst_rows, miss_mask)
+
+        staged = torch.empty(
+            (row_ids.shape[1] // block_size, block_size, row_width),
+            dtype=kv_c_and_k_pe_cache.dtype,
+            device=device,
         )
-        new_bt = torch.arange(
-            num_b * max_blocks, dtype=torch.int32, device=block_table.device
-        ).view(num_b, max_blocks)
+        staged_2d = staged.view(-1, row_width)
+        # staged_2d doubles as the (never-taken) CUDA source: the host pool
+        # covers every referenced block and its validity is all-true.
+        torch.ops._C_cache_ops.hisparse_gather_plan(
+            staged_2d,
+            kv_c_and_k_pe_cache.view(-1, row_width),
+            coordinator._host_cache_valid,
+            staged_2d,
+            row_ids,
+            dst_rows,
+            miss_mask,
+            None,
+        )
         return staged, new_bt
 
     def do_kv_cache_update(

@@ -1688,3 +1688,32 @@ def test_hisparse_build_warm_start_slots():
     slots, lens = build_warm_start_slots([([1], 0), ([2], 0)], block_size, max_width)
     assert slots.shape == (2, 0)
     assert lens.tolist() == [0, 0]
+
+
+def test_hisparse_prefill_staging_remap():
+    """Compacted staging references the same host rows as direct indexing."""
+    from vllm.v1.attention.backends.mla.flashmla_sparse import (
+        hisparse_prefill_staging_remap,
+    )
+
+    block_size = 4
+    block_table = torch.tensor(
+        [[5, 2, -1, -1], [2, 7, 3, -1], [9, -1, -1, -1]], dtype=torch.int32
+    )
+
+    new_bt, row_ids = hisparse_prefill_staging_remap(block_table, block_size)
+
+    assert new_bt.shape == block_table.shape
+    assert row_ids.dtype == torch.int32 and new_bt.dtype == torch.int32
+    n_unique = len({0, 2, 3, 5, 7, 9})  # -1 clamps to block 0
+    assert row_ids.shape == (1, n_unique * block_size)
+    flat_rows = row_ids.flatten()
+    for i in range(block_table.shape[0]):
+        for j in range(block_table.shape[1]):
+            orig = max(int(block_table[i, j]), 0)
+            staged = int(new_bt[i, j])
+            for k in range(block_size):
+                assert (
+                    int(flat_rows[staged * block_size + k])
+                    == orig * block_size + k
+                )
