@@ -527,7 +527,8 @@ void hisparse_swap_in(
     torch::stable::Tensor& lru_slots,
     std::optional<torch::stable::Tensor> const& num_real_reqs,
     int64_t region_stride,
-    std::optional<torch::stable::Tensor> const& miss_mask);
+    std::optional<torch::stable::Tensor> const& miss_mask,
+    std::optional<torch::stable::Tensor> const& stats);
 
 void hisparse_gather_plan(
     torch::stable::Tensor const& source_cache,

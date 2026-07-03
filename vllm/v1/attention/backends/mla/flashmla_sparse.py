@@ -636,6 +636,11 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                             self.hisparse_coordinator
                         )
                         self.hisparse_coordinator.leader = _HISPARSE_CURRENT_LEADER
+                        # Telemetry: the leader's misses are re-gathered by
+                        # this shared layer too.
+                        _HISPARSE_CURRENT_LEADER.stats_row_bytes += (
+                            self.hisparse_coordinator.stats_row_bytes
+                        )
         self._hisparse_decode_batch = False
         self._hisparse_dummy_batch = False
         # Prefill BF16 kernel requires 64 on Hopper, 128 on Blackwell

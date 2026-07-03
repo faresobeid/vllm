@@ -847,7 +847,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                 Tensor! lru_slots,"
       "                 Tensor? num_real_reqs,"
       "                 int region_stride,"
-      "                 Tensor(a!)? miss_mask=None) -> ()");
+      "                 Tensor(a!)? miss_mask=None,"
+      "                 Tensor(b!)? stats=None) -> ()");
 
   ops.def(
       "hisparse_gather_plan(Tensor source_cache,"

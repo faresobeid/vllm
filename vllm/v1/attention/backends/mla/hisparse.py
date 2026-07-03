@@ -129,10 +129,51 @@ def get_num_real_reqs_tensor(device: torch.device) -> torch.Tensor:
     return tensor
 
 
+# Coordinators with live swap-in counters (full layers), for telemetry.
+_STATS: list["HiSparseCoordinator"] = []
+_STATS_INTERVAL = 2000
+_stats_calls = 0
+_stats_last = (0, 0, 0)
+
+
+def _maybe_log_hisparse_stats() -> None:
+    """Log aggregate hot-buffer hit rate + PCIe gather volume periodically.
+
+    Counters accumulate in-kernel (graph-safe); this host-side read costs a
+    few tiny D2H copies every _STATS_INTERVAL steps.
+    """
+    global _stats_calls, _stats_last
+    _stats_calls += 1
+    if not _STATS or _stats_calls % _STATS_INTERVAL != 0:
+        return
+    hits = misses = gather_bytes = 0
+    for c in _STATS:
+        h, m = c._swap_stats.cpu().tolist()
+        hits += h
+        misses += m
+        gather_bytes += m * c.stats_row_bytes
+    d_hits = hits - _stats_last[0]
+    d_misses = misses - _stats_last[1]
+    d_bytes = gather_bytes - _stats_last[2]
+    _stats_last = (hits, misses, gather_bytes)
+    total = d_hits + d_misses
+    if total == 0:
+        return
+    logger.info(
+        "HiSparse (last %d steps): hit rate %.1f%%, %.2f GiB gathered "
+        "host->device (%d misses).",
+        _STATS_INTERVAL,
+        100.0 * d_hits / total,
+        d_bytes / 2**30,
+        d_misses,
+    )
+
+
 def set_num_real_reqs(num_reqs: int) -> None:
     """Called by the model runner before each (real or dummy) forward."""
     for tensor in _NUM_REAL_REQS.values():
         tensor.fill_(num_reqs)
+    _maybe_log_hisparse_stats()
 
 
 def invalidate_blocks(
@@ -217,7 +258,7 @@ def _has_hisparse_ops() -> bool:
         return False
     # Guard against stale builds that carry an older hisparse_swap_in schema.
     schema = str(torch.ops._C_cache_ops.hisparse_swap_in.default._schema)
-    return "num_real_reqs" in schema
+    return "num_real_reqs" in schema and "stats" in schema
 
 
 class _GroupPlan:
@@ -334,6 +375,14 @@ class HiSparseCoordinator:
         )
 
         self.num_real_reqs = get_num_real_reqs_tensor(self.device)
+
+        # In-kernel hit/miss counters (telemetry). stats_row_bytes converts
+        # misses to gathered bytes; plan-once wiring adds each shared
+        # layer's row bytes to its leader (the shared layers re-gather the
+        # leader's misses), so the leader's counter covers the whole group.
+        self._swap_stats = torch.zeros(2, dtype=torch.uint64, device=self.device)
+        self.stats_row_bytes = row_bytes
+        _STATS.append(self)
 
         # Group-shared plan buffers for index-sharing plan-once (see _GroupPlan).
         self._plan = _get_group_plan(self.device, max_num_reqs, config.top_k)
@@ -792,6 +841,7 @@ class HiSparseCoordinator:
                 self.num_real_reqs,
                 self.region_stride,
                 miss_mask,
+                self._swap_stats,
             )
         else:
             self._swap_in_fallback(
