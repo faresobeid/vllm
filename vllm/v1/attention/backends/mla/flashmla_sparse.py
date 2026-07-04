@@ -707,17 +707,6 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 (q_concat_shape, torch.bfloat16),
             )
 
-    def _is_hisparse_decode(
-        self,
-        attn_metadata: FlashMLASparseMetadata,
-        num_actual_toks: int,
-    ) -> bool:
-        return self.hisparse_coordinator is not None and is_hisparse_decode_batch(
-            max_query_len=attn_metadata.max_query_len,
-            num_reqs=attn_metadata.num_reqs,
-            num_actual_tokens=num_actual_toks,
-        )
-
     def prepare_hisparse_for_batch(
         self,
         attn_metadata: FlashMLASparseMetadata | None,
@@ -785,22 +774,8 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         padded table, and the index remap — identical for every layer — is
         cached per (block table identity, mutation version).
         """
-        coordinator = self.hisparse_coordinator
-        assert coordinator is not None
-        device = block_table.device
-        if not coordinator._use_cuda_ops or coordinator._host_cache_valid is None:
-            # Python reference path (kernels unavailable): CPU-index the pool.
-            num_b, max_blocks = block_table.shape
-            flat_ids = block_table.to(device="cpu", dtype=torch.long).clamp_(min=0)
-            staged = kv_c_and_k_pe_cache[flat_ids.flatten()].to(
-                device=device, non_blocking=True
-            )
-            new_bt = torch.arange(
-                num_b * max_blocks, dtype=torch.int32, device=device
-            ).view(num_b, max_blocks)
-            return staged, new_bt
-
         global _HISPARSE_PREFILL_REMAP
+        device = block_table.device
         block_size = kv_c_and_k_pe_cache.shape[1]
         row_width = kv_c_and_k_pe_cache.shape[-1]
         key = (block_table.data_ptr(), block_table.shape, block_table._version)
@@ -823,12 +798,8 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             device=device,
         )
         staged_2d = staged.view(-1, row_width)
-        # staged_2d doubles as the (never-taken) CUDA source: the host pool
-        # covers every referenced block and its validity is all-true.
         torch.ops._C_cache_ops.hisparse_gather_plan(
-            staged_2d,
             kv_c_and_k_pe_cache.view(-1, row_width),
-            coordinator._host_cache_valid,
             staged_2d,
             row_ids,
             dst_rows,
@@ -863,21 +834,9 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         if not self._hisparse_decode_batch:
             # Local prefill on this instance (router shortcut for short
             # suffixes, preemption resume, recompute after a failed KV
-            # load): write the rows straight to the host pool (or to the
-            # GPU cache + mirror in mirror mode). Slower than PD prefill;
-            # correct either way.
-            self.hisparse_coordinator.bind_source_cache(kv_cache)
-            if self.hisparse_coordinator.source_is_host:
-                self.hisparse_coordinator.write_rows_to_host(
-                    kv_c_normed,
-                    k_pe,
-                    kv_cache,
-                    slot_mapping,
-                    kv_cache_dtype,
-                    k_scale,
-                )
-                return
-            super().do_kv_cache_update(
+            # load): write the rows straight to the host pool. Slower than
+            # PD prefill; correct either way.
+            self.hisparse_coordinator.write_rows_to_host(
                 kv_c_normed,
                 k_pe,
                 kv_cache,
@@ -885,7 +844,6 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 kv_cache_dtype,
                 k_scale,
             )
-            self.hisparse_coordinator.mirror_slots(kv_cache, slot_mapping)
             return
 
         self.hisparse_coordinator.write_newest_rows(
@@ -904,7 +862,10 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         topk_indices: torch.Tensor,
         attn_metadata: FlashMLASparseMetadata,
     ) -> torch.Tensor:
-        if self._is_hisparse_decode(attn_metadata, q.shape[0]):
+        # Set by prepare_hisparse_for_batch on the same metadata this step
+        # (q is already sliced to num_actual_tokens; dummy runs never reach
+        # the forward paths).
+        if self._hisparse_decode_batch:
             kv_c_and_k_pe_cache, topk_indices, topk_length = self._hisparse_swap_in(
                 kv_c_and_k_pe_cache,
                 topk_indices,
@@ -1090,7 +1051,8 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         prefill kernel which has head padding overhead when num_heads is small.
         Used when use_mixed_batch is True.
         """
-        if self._is_hisparse_decode(attn_metadata, q.shape[0]):
+        # Set by prepare_hisparse_for_batch on the same metadata this step.
+        if self._hisparse_decode_batch:
             kv_c_and_k_pe_cache, topk_indices = self._hisparse_swap_in(
                 kv_c_and_k_pe_cache,
                 topk_indices,

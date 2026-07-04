@@ -1213,18 +1213,16 @@ class VllmConfig:
                     self.kv_transfer_config.kv_connector,
                 )
 
-            if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-                from vllm.v1.attention.backends.mla.hisparse import (
-                    _has_hisparse_ops,
-                )
+            from vllm.v1.attention.backends.mla.hisparse import (
+                _has_hisparse_ops,
+            )
 
-                if not _has_hisparse_ops():
-                    logger.warning(
-                        "HiSparse CUDA ops are not compiled; the Python "
-                        "fallback is not CUDA-graph capturable. Disabling "
-                        "CUDA graphs."
-                    )
-                    self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+            if not _has_hisparse_ops():
+                raise RuntimeError(
+                    "HiSparse requires the compiled CUDA ops "
+                    "(_C_cache_ops.hisparse_*) with the current schema; "
+                    "this build is missing or stale. Rebuild vLLM."
+                )
 
         if (
             self.compilation_config.cudagraph_mode.requires_piecewise_compilation()

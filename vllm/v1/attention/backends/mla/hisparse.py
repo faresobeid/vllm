@@ -7,15 +7,13 @@ HiSparse keeps the full-size MLA KV off the GPU and serves decode from a small
 per-request device hot buffer; that is what frees GPU memory for higher decode
 concurrency.
 
-- Full-size KV residency. In the host-resident deployment the MLA KV layers
-  are allocated in pinned host memory (see ``_is_hisparse_host_layer`` and
-  ``_allocate_kv_cache_tensors`` in the cache utils / model runner); only the
-  GPU indexer pool and the per-request hot buffers stay on device. A
-  GPU-cache deployment is also supported: the full GPU KV cache remains the
-  store and every written row is mirrored into a pinned host cache keyed by
-  its global KV slot id. Either way the mirror/backup is done by a CUDA kernel
-  writing straight into pinned memory, so it is stream-ordered with the decode
-  kernels and needs no host synchronization.
+- Full-size KV residency. The MLA KV layers are allocated in pinned host
+  memory (see ``_is_hisparse_host_layer`` and ``_allocate_kv_cache_tensors``
+  in the cache utils / model runner); only the GPU indexer pool and the
+  per-request hot buffers stay on device. Decode-step writes land in the
+  reserved hot slot and are scattered back to the host pool by a CUDA kernel
+  writing straight into pinned memory, so the backup is stream-ordered with
+  the decode kernels and needs no host synchronization.
 - Each batch row owns a fixed per-layer hot region of
   ``region_stride = round_up(device_buffer_size + 1, 128)`` KV rows (padded to
   128 so the flat buffer can be viewed with any kernel page size up to 128).
@@ -24,9 +22,9 @@ concurrency.
   directly (mirroring SGLang's reserved newest page).
 - At decode time, the indexer's top-k positions are converted to global slot
   ids and a swap-in kernel resolves them against the hot region: hits are
-  reused, misses are copied from the pinned host pool (or the GPU cache in
-  mirror mode), and the LRU order is updated — the same algorithm as SGLang's
-  ``load_cache_to_device_buffer`` kernel.
+  reused, misses are copied from the pinned host pool, and the LRU order is
+  updated — the same algorithm as SGLang's ``load_cache_to_device_buffer``
+  kernel.
 """
 
 from __future__ import annotations
@@ -220,6 +218,10 @@ def _maybe_log_hisparse_stats() -> None:
         return
     hits = misses = gather_bytes = 0
     for c in _STATS:
+        if c.leader is not None:
+            # Shared layers never accumulate; their leader's counter (with
+            # stats_row_bytes summed over the group) covers them.
+            continue
         h, m = c._swap_stats.cpu().tolist()
         hits += h
         misses += m
@@ -265,6 +267,37 @@ def _leader_coordinators(
     ]
 
 
+# Persistent pinned staging for the per-step H2D index uploads below
+# (invalidated slots, reset rows, warm-start rows). One shared buffer is
+# safe: these uploads run eagerly at batch preparation, never under
+# CUDA-graph capture, and the event guards against overwriting bytes a
+# previous upload's async copy is still reading.
+_PINNED_STAGING: torch.Tensor | None = None
+_PINNED_STAGING_EVENT: torch.cuda.Event | None = None
+
+
+def _pinned_to_device(values: list[int], device: torch.device) -> torch.Tensor:
+    """Copy a small int list to ``device`` via pinned staging (grow-on-demand,
+    power-of-2) instead of a per-step pageable tensor."""
+    global _PINNED_STAGING, _PINNED_STAGING_EVENT
+    if device.type != "cuda":
+        return torch.tensor(values, dtype=torch.long, device=device)
+    n = len(values)
+    if _PINNED_STAGING is None or _PINNED_STAGING.shape[0] < n:
+        size = 1 << max(10, (n - 1).bit_length())
+        _PINNED_STAGING = torch.empty(size, dtype=torch.long, pin_memory=True)
+        _PINNED_STAGING_EVENT = None
+    if _PINNED_STAGING_EVENT is not None:
+        _PINNED_STAGING_EVENT.synchronize()
+    staging = _PINNED_STAGING[:n]
+    staging.copy_(torch.from_numpy(np.asarray(values, dtype=np.int64)))
+    out = staging.to(device, non_blocking=True)
+    if _PINNED_STAGING_EVENT is None:
+        _PINNED_STAGING_EVENT = torch.cuda.Event()
+    _PINNED_STAGING_EVENT.record(torch.cuda.current_stream(device))
+    return out
+
+
 def invalidate_blocks(
     static_forward_context: dict, block_ids: list[int], block_size: int
 ) -> None:
@@ -273,16 +306,15 @@ def invalidate_blocks(
     Called by the model runner when blocks are (re)assigned to newly scheduled
     or preemption-resumed requests, before any forward step can select them.
     This makes block recycling safe for any writer (local prefill, connector
-    RDMA into GPU or host memory) without per-connector reporting hooks.
+    RDMA into host memory) without per-connector reporting hooks.
     """
     if not block_ids:
         return
     slots: torch.Tensor | None = None
     for coordinator in _leader_coordinators(static_forward_context):
         if slots is None:
-            blocks = torch.tensor(
-                block_ids, dtype=torch.long, device=coordinator.device
-            )
+            # Built once on device and shared by every leader.
+            blocks = _pinned_to_device(block_ids, coordinator.device)
             offsets = torch.arange(
                 block_size, dtype=torch.long, device=coordinator.device
             )
@@ -297,7 +329,7 @@ def reset_rows(static_forward_context: dict, row_ids: list[int]) -> None:
     rows: torch.Tensor | None = None
     for coordinator in _leader_coordinators(static_forward_context):
         if rows is None:
-            rows = torch.tensor(row_ids, dtype=torch.long, device=coordinator.device)
+            rows = _pinned_to_device(row_ids, coordinator.device)
         coordinator.reset_hot_rows(rows)
 
 
@@ -364,7 +396,7 @@ def warm_start_requests(
     if slots_np.shape[1] == 0:
         return
 
-    rows = torch.tensor(row_ids, dtype=torch.long, device=device)
+    rows = _pinned_to_device(row_ids, device)
     global_slots = torch.from_numpy(slots_np).to(device)
     lens = torch.from_numpy(lens_np).to(device)
     # The staging plan (hot positions, miss mask, rotated LRU) is identical
@@ -402,19 +434,6 @@ def _warm_start_plan(
     return hot_indices, miss_mask, lru
 
 
-# Shared all-true validity bitmap for host-resident pools: every slot the
-# scheduler hands out is written before the indexer can select it, so the
-# swap-in kernel may treat the whole pool as valid.
-_ALL_VALID: torch.Tensor | None = None
-
-
-def get_all_valid_tensor(num_rows: int) -> torch.Tensor:
-    global _ALL_VALID
-    if _ALL_VALID is None or _ALL_VALID.shape[0] < num_rows:
-        _ALL_VALID = torch.ones(num_rows, dtype=torch.bool, pin_memory=True)
-    return _ALL_VALID
-
-
 def _has_hisparse_ops() -> bool:
     try:
         try:
@@ -430,9 +449,10 @@ def _has_hisparse_ops() -> bool:
         and hasattr(torch.ops._C_cache_ops, "hisparse_backup")
     ):
         return False
-    # Guard against stale builds that carry an older hisparse_swap_in schema.
+    # Guard against stale builds that carry an older hisparse_swap_in schema
+    # (the host-resident-only signature has no source_cache parameter).
     schema = str(torch.ops._C_cache_ops.hisparse_swap_in.default._schema)
-    return "num_real_reqs" in schema and "stats" in schema
+    return "source_cache" not in schema and "stats" in schema
 
 
 class _GroupPlan:
@@ -494,11 +514,12 @@ def _get_copy_stream(device: torch.device) -> "torch.cuda.Stream":
 class HiSparseCoordinator:
     """Per-layer decode-time hot buffer for sparse MLA KV rows.
 
-    Hot-buffer hits are keyed by global KV slot id, so correctness relies on
-    one invariant: a recycled slot's stale state is dropped before reuse —
-    write paths (``mirror_slots``/``write_newest_rows``) invalidate the slots
-    they write, and the model runner invalidates all blocks (re)assigned to
-    incoming requests (covering connector RDMA loads of any kind).
+    The pinned host-resident KV pool is the only full-size store; misses are
+    always served from it. Hot-buffer hits are keyed by global KV slot id, so
+    correctness relies on one invariant: a recycled slot's stale state is
+    dropped before reuse — the model runner invalidates all blocks
+    (re)assigned to incoming requests (covering connector RDMA loads of any
+    kind) before any step can select them.
     """
 
     def __init__(
@@ -509,6 +530,13 @@ class HiSparseCoordinator:
         kv_dtype: torch.dtype,
         device: torch.device | str,
     ) -> None:
+        if not _has_hisparse_ops():
+            raise RuntimeError(
+                "HiSparse requires the compiled _C_cache_ops.hisparse_swap_in/"
+                "gather_plan/backup CUDA kernels (host-resident decode has no "
+                "Python fallback). Rebuild vLLM from source so "
+                "csrc/libtorch_stable/hisparse_kernels.cu is included."
+            )
         self.config = config
         self.max_num_reqs = max_num_reqs
         self.row_width = row_width
@@ -575,18 +603,12 @@ class HiSparseCoordinator:
         self._overlap_enabled = (
             os.environ.get("VLLM_HISPARSE_OVERLAP", "1") == "1"
             and self.device.type == "cuda"
-            and _has_hisparse_ops()
         )
         self._copy_stream = (
             _get_copy_stream(self.device) if self._overlap_enabled else None
         )
 
-        self._source_cache: torch.Tensor | None = None
-        self._source_is_host = False
         self._host_cache: torch.Tensor | None = None
-        self._host_cache_valid: torch.Tensor | None = None
-        self._host_is_pinned = False
-        self._use_cuda_ops = _has_hisparse_ops()
         # Host backup runs INLINE on the current/capture stream (no dedicated
         # backup stream). The decode KV-update (write_newest_rows -> _backup_rows)
         # executes inside the FULL_DECODE_ONLY CUDA graph; a cross-stream wait
@@ -597,26 +619,16 @@ class HiSparseCoordinator:
         # there is no overlap worth reclaiming. (SGLang overlaps its backup by
         # issuing it from the scheduler prepare phase, outside capture -- the
         # only sound place for a future async variant.)
-        if not self._use_cuda_ops:
-            logger.warning_once(
-                "HiSparse CUDA ops (_C_cache_ops.hisparse_swap_in/backup) are "
-                "not compiled. Host-resident HiSparse requires these ops; "
-                "mirror-mode tests may still use the Python reference path."
-            )
 
     def hot_cache_paged(self, block_size: int) -> torch.Tensor:
         """Hot buffer shaped like a regular paged MLA cache."""
         return self.hot_cache.view(-1, block_size, self.row_width)
 
-    @property
-    def source_is_host(self) -> bool:
-        return self._source_is_host
-
     def bind_source_cache(self, kv_cache: torch.Tensor) -> None:
         flat = kv_cache.view(-1, kv_cache.shape[-1])
-        if self._source_cache is not None and (
-            self._source_cache.data_ptr() == flat.data_ptr()
-            and self._source_cache.shape == flat.shape
+        if self._host_cache is not None and (
+            self._host_cache.data_ptr() == flat.data_ptr()
+            and self._host_cache.shape == flat.shape
         ):
             return
 
@@ -626,60 +638,20 @@ class HiSparseCoordinator:
                 f"layout: expected ({self.row_width}, {self.kv_dtype}), got "
                 f"({kv_cache.shape[-1]}, {kv_cache.dtype})."
             )
+        # Host-resident pool: the cache itself is the only full-size store;
+        # every allocated slot is written before the indexer can select it.
+        if kv_cache.device.type != "cpu":
+            raise ValueError(
+                "HiSparse requires a host-resident KV pool; got a KV cache "
+                f"on {kv_cache.device}."
+            )
+        if not kv_cache.is_pinned():
+            raise ValueError(
+                "HiSparse host-resident KV pool must be pinned memory."
+            )
 
-        self._source_cache = flat
+        self._host_cache = flat
         self.reset_hot_state()
-
-        num_slots = flat.shape[0]
-        if kv_cache.device.type == "cpu":
-            # Host-resident pool: the cache itself is the host store. No
-            # mirror is needed; every allocated slot is written before use.
-            if not kv_cache.is_pinned():
-                raise ValueError(
-                    "HiSparse host-resident KV pool must be pinned memory."
-                )
-            if not self._use_cuda_ops:
-                raise RuntimeError(
-                    "HiSparse host-resident KV requires compiled "
-                    "_C_cache_ops.hisparse_swap_in/backup kernels. Rebuild "
-                    "vLLM from source so csrc/hisparse_kernels.cu is included."
-                )
-            self._source_is_host = True
-            self._host_cache = flat
-            self._host_cache_valid = get_all_valid_tensor(num_slots)
-            self._host_is_pinned = True
-            return
-
-        self._source_is_host = False
-        if (
-            self._host_cache is not None
-            and self._host_cache.shape[0] >= num_slots
-        ):
-            self._host_cache_valid.zero_()  # type: ignore[union-attr]
-            return
-
-        try:
-            self._host_cache = torch.empty(
-                (num_slots, self.row_width),
-                dtype=self.kv_dtype,
-                device="cpu",
-                pin_memory=True,
-            )
-            self._host_cache_valid = torch.zeros(
-                num_slots, dtype=torch.bool, pin_memory=True
-            )
-            self._host_is_pinned = True
-        except RuntimeError:
-            logger.warning_once(
-                "HiSparse failed to pin %.2f GiB of host mirror memory; "
-                "falling back to pageable memory and the slow Python path.",
-                num_slots * self.row_width * self.kv_dtype.itemsize / 2**30,
-            )
-            self._host_cache = torch.empty(
-                (num_slots, self.row_width), dtype=self.kv_dtype, device="cpu"
-            )
-            self._host_cache_valid = torch.zeros(num_slots, dtype=torch.bool)
-            self._host_is_pinned = False
 
     def reset_hot_state(self) -> None:
         """Drop all hot-buffer bookkeeping (hits become misses)."""
@@ -727,17 +699,13 @@ class HiSparseCoordinator:
         so staging must be all-of-group or none.
         """
         group = [self, *self.group_shared]
-        if not all(c._use_cuda_ops and c._source_is_host for c in group):
-            return
         if any(coord._host_cache is None for coord in group):
             # Not fully bound yet (first forwards); the miss path covers it.
             return
         hot_indices, miss_mask, lru = plan
         for coord in group:
             torch.ops._C_cache_ops.hisparse_gather_plan(
-                coord.hot_cache,
                 coord._host_cache,
-                coord._host_cache_valid,
                 coord.hot_cache,
                 global_slots,
                 hot_indices,
@@ -759,22 +727,11 @@ class HiSparseCoordinator:
 
         Called when blocks are (re)assigned to a request, regardless of who
         writes them (local prefill, KV connector RDMA, ...). Hot-buffer
-        copies of recycled slots must never be served as hits, and in
-        mirror mode the stale host rows must not be preferred over the
-        rewritten GPU source rows.
+        copies of recycled slots must never be served as hits.
         """
-        if self._source_cache is None:
+        if self._host_cache is None:
             return
         self._invalidate_hot_copies(slots)
-        if not self._source_is_host and self._host_cache_valid is not None:
-            slots_cpu = slots.to(device="cpu", dtype=torch.long)
-            slots_cpu = slots_cpu[
-                (slots_cpu >= 0) & (slots_cpu < self._host_cache_valid.shape[0])
-            ]
-            self._host_cache_valid[slots_cpu] = False
-
-    def _kernel_path(self) -> bool:
-        return self._use_cuda_ops and self._host_is_pinned
 
     def _backup_rows(
         self,
@@ -782,53 +739,13 @@ class HiSparseCoordinator:
         src_indices: torch.Tensor,
         dst_slots: torch.Tensor,
     ) -> None:
-        assert self._host_cache is not None and self._host_cache_valid is not None
+        assert self._host_cache is not None
         torch.ops._C_cache_ops.hisparse_backup(
             src_cache,
             src_indices,
             self._host_cache,
-            self._host_cache_valid,
             dst_slots,
         )
-
-    # -------------------------------------------------------------- mirroring
-
-    def mirror_slots(
-        self,
-        kv_cache: torch.Tensor,
-        slot_mapping: torch.Tensor | None,
-    ) -> None:
-        """Mirror the given global KV slots from the cache into host memory."""
-        if slot_mapping is None or kv_cache.numel() == 0:
-            return
-        self.bind_source_cache(kv_cache)
-        valid_slots = slot_mapping.flatten()
-        valid_slots = valid_slots[valid_slots >= 0].to(torch.int64)
-        if valid_slots.numel() == 0:
-            return
-
-        assert self._source_cache is not None
-        if self._source_is_host:
-            # Data already lives in the host pool; only stale hot-buffer
-            # copies of these (possibly recycled) slots must be dropped.
-            pass
-        elif self._kernel_path():
-            self._backup_rows(
-                self._source_cache,
-                valid_slots,
-                valid_slots,
-            )
-        else:
-            self._mirror_slots_fallback(valid_slots)
-        self._invalidate_hot_copies(valid_slots)
-
-    def _mirror_slots_fallback(self, valid_slots: torch.Tensor) -> None:
-        assert self._source_cache is not None
-        assert self._host_cache is not None and self._host_cache_valid is not None
-        rows = self._source_cache.index_select(0, valid_slots).to(device="cpu")
-        slots_cpu = valid_slots.to(device="cpu")
-        self._host_cache[slots_cpu] = rows
-        self._host_cache_valid[slots_cpu] = True
 
     # ------------------------------------------------------- newest-token path
 
@@ -843,12 +760,10 @@ class HiSparseCoordinator:
     ) -> None:
         """Decode-step KV update.
 
-        Writes the newest token of each batch row to:
-        - its global KV slot (keeps the full GPU cache complete, so mixed
-          batches, preemption-resume, and prefix sharing stay correct),
-        - its reserved hot slot (so the swap-in kernel can serve the newest
-          token without a host roundtrip, like SGLang's reserved page),
-        - the pinned host mirror (so later steps can miss-load it).
+        Writes the newest token of each batch row to its reserved hot slot
+        (so the swap-in kernel can serve the newest token without a host
+        roundtrip, like SGLang's reserved page), then scatters it into the
+        host pool at its global KV slot (so later steps can miss-load it).
         """
         from vllm import _custom_ops as ops
 
@@ -859,49 +774,22 @@ class HiSparseCoordinator:
         assert num_tokens <= self.max_num_reqs
         newest_slots = self._newest_hot_slots[:num_tokens]
         global_slots = slot_mapping[:num_tokens].to(torch.int64)
-        assert self._source_cache is not None
 
-        if self._source_is_host:
-            # Host-resident pool: write the newest rows into the reserved hot
-            # slots (GPU), then scatter them into the host pool. -1-padded
-            # slots (CUDA-graph padding) are skipped by the backup kernel.
-            ops.concat_and_cache_mla(
-                kv_c_normed,
-                k_pe.squeeze(1),
-                self.hot_cache.view(-1, 1, self.row_width),
-                newest_slots,
-                kv_cache_dtype=kv_cache_dtype,
-                scale=k_scale,
-            )
-            self._backup_rows(
-                self.hot_cache,
-                newest_slots,
-                global_slots,
-            )
-        else:
-            ops.concat_and_cache_mla(
-                kv_c_normed,
-                k_pe.squeeze(1),
-                kv_cache,
-                global_slots,
-                kv_cache_dtype=kv_cache_dtype,
-                scale=k_scale,
-            )
-            # CUDA-graph padding fills slot_mapping with -1; clamp so the
-            # gather stays in bounds (padded rows then just hold row 0's
-            # bytes, which is harmless since their hot indices are never
-            # consumed).
-            rows = self._source_cache.index_select(0, global_slots.clamp(min=0))
-            self.hot_cache.index_copy_(0, newest_slots, rows)
-
-            if self._kernel_path():
-                self._backup_rows(
-                    self._source_cache,
-                    global_slots,
-                    global_slots,
-                )
-            else:
-                self._mirror_slots_fallback(global_slots)
+        # -1-padded slots (CUDA-graph padding) are skipped by the backup
+        # kernel.
+        ops.concat_and_cache_mla(
+            kv_c_normed,
+            k_pe.squeeze(1),
+            self.hot_cache.view(-1, 1, self.row_width),
+            newest_slots,
+            kv_cache_dtype=kv_cache_dtype,
+            scale=k_scale,
+        )
+        self._backup_rows(
+            self.hot_cache,
+            newest_slots,
+            global_slots,
+        )
         # Recycled-slot hygiene is handled at block-assignment time: the
         # model runner invalidates every block (re)assigned to any request
         # (new, resumed, or growing) before the step that first writes it,
@@ -916,7 +804,7 @@ class HiSparseCoordinator:
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
     ) -> None:
-        """Write prefill/mixed-batch rows directly to a host-resident pool.
+        """Write prefill/mixed-batch rows directly to the host pool.
 
         Local prefill on a decode instance (router shortcut, preemption
         resume, recompute after a failed KV load): quantize the rows on GPU,
@@ -929,8 +817,6 @@ class HiSparseCoordinator:
         if kv_cache.numel() == 0:
             return
         self.bind_source_cache(kv_cache)
-        if not self._source_is_host:
-            raise RuntimeError("write_rows_to_host requires a host-resident KV pool.")
         flat_slots = slot_mapping.flatten()[: kv_c_normed.shape[0]]
         valid_mask = flat_slots >= 0
         valid = flat_slots[valid_mask].to(device=self.device, dtype=torch.int64)
@@ -1051,34 +937,21 @@ class HiSparseCoordinator:
             hot_indices = torch.full_like(global_indices, -1)
             miss_mask = None
 
-        if self._kernel_path():
-            # Padded rows are skipped by the kernel (num_real_reqs) and must
-            # come out as -1 so the attention kernel masks them.
-            # In host-resident mode every miss is served from the host pool
-            # (validity is all-true), so the GPU source fallback is dead; pass
-            # the hot cache to satisfy the kernel's CUDA-source requirement.
-            kernel_source = (
-                self.hot_cache if self._source_is_host else self._source_cache
-            )
-            torch.ops._C_cache_ops.hisparse_swap_in(
-                kernel_source,
-                self._host_cache,
-                self._host_cache_valid,
-                self.hot_cache,
-                global_indices,
-                newest_global,
-                hot_indices,
-                self.device_global_indices,
-                self.lru_slots,
-                self.num_real_reqs,
-                self.region_stride,
-                miss_mask,
-                self._swap_stats,
-            )
-        else:
-            self._swap_in_fallback(
-                global_indices, newest_global, hot_indices, miss_mask
-            )
+        # Padded rows are skipped by the kernel (num_real_reqs) and must
+        # come out as -1 so the attention kernel masks them.
+        torch.ops._C_cache_ops.hisparse_swap_in(
+            self._host_cache,
+            self.hot_cache,
+            global_indices,
+            newest_global,
+            hot_indices,
+            self.device_global_indices,
+            self.lru_slots,
+            self.num_real_reqs,
+            self.region_stride,
+            miss_mask,
+            self._swap_stats,
+        )
 
         if produce_plan:
             # Shared layers reuse the group's counts (identical top-k).
@@ -1102,21 +975,10 @@ class HiSparseCoordinator:
         return self.hot_cache_paged(block_size), hot_indices, valid_counts
 
     def _gather_plan_into(self, num_tokens: int) -> None:
-        """Gather THIS coord's misses per the group-shared plan into its own hot
-        cache, on the current stream. Host-resident: misses come from the host
-        pool (kernel_source is the hot cache, a no-op fallback source)."""
-        # At prefetch time the shared layer may not have bound its per-forward
-        # source yet; the hot cache is always a valid CUDA source and host-valid
-        # misses are served from the host pool regardless.
-        kernel_source = (
-            self._source_cache
-            if (not self._source_is_host and self._source_cache is not None)
-            else self.hot_cache
-        )
+        """Gather THIS coord's misses per the group-shared plan into its own
+        hot cache, from the host pool, on the current stream."""
         torch.ops._C_cache_ops.hisparse_gather_plan(
-            kernel_source,
             self._host_cache,
-            self._host_cache_valid,
             self.hot_cache,
             self._plan.global_indices[:num_tokens],
             self._plan.hot_indices[:num_tokens],
@@ -1142,104 +1004,6 @@ class HiSparseCoordinator:
                 if shared._prefetch_event is None:
                     shared._prefetch_event = torch.cuda.Event()
                 shared._prefetch_event.record(self._copy_stream)
-
-    def _swap_in_fallback(
-        self,
-        global_indices: torch.Tensor,
-        newest_global: torch.Tensor | None,
-        hot_indices: torch.Tensor,
-        miss_mask: torch.Tensor | None = None,
-    ) -> None:
-        """Slow reference implementation of the swap-in kernel semantics.
-
-        Writes resolved slots into ``hot_indices`` in place; when ``miss_mask``
-        is given, sets it to 1 at columns resolved as a miss (matching the
-        kernel's plan output for the group-shared replay path).
-        """
-        assert self._source_cache is not None
-        assert self._host_cache is not None and self._host_cache_valid is not None
-        num_tokens, _ = global_indices.shape
-        buf = self.config.device_buffer_size
-        hot_indices.fill_(-1)
-        if miss_mask is not None:
-            miss_mask.fill_(0)
-
-        global_cpu = global_indices.cpu().tolist()
-        newest_cpu = (
-            newest_global.cpu().tolist()
-            if newest_global is not None
-            else [-1] * num_tokens
-        )
-        dgi_cpu = self.device_global_indices[:num_tokens].cpu().tolist()
-        lru_cpu = self.lru_slots[:num_tokens].cpu().tolist()
-
-        miss_src: list[int] = []
-        miss_dst: list[int] = []
-        for row in range(num_tokens):
-            base = row * self.region_stride
-            slot_of_global = {
-                g: slot for slot, g in enumerate(dgi_cpu[row]) if g >= 0
-            }
-            hit_slots: list[int] = []
-            hit_cols: dict[int, int] = {}
-            for col, g in enumerate(global_cpu[row]):
-                if g < 0:
-                    continue
-                if g == newest_cpu[row]:
-                    hot_indices[row, col] = base + buf
-                elif g in slot_of_global:
-                    hit_cols[slot_of_global[g]] = col
-
-            # Classify slots in LRU order, like the kernel does.
-            evictables = [s for s in lru_cpu[row] if s not in hit_cols]
-            hit_slots = [s for s in lru_cpu[row] if s in hit_cols]
-            for slot in hit_slots:
-                hot_indices[row, hit_cols[slot]] = base + slot
-
-            misses = [
-                (col, g)
-                for col, g in enumerate(global_cpu[row])
-                if g >= 0 and g != newest_cpu[row] and g not in slot_of_global
-            ]
-            miss_slots = []
-            for m, (col, g) in enumerate(misses):
-                slot = evictables[m]
-                miss_slots.append(slot)
-                hot_indices[row, col] = base + slot
-                if miss_mask is not None:
-                    miss_mask[row, col] = 1
-                dgi_cpu[row][slot] = g
-                miss_src.append(g)
-                miss_dst.append(base + slot)
-
-            lru_cpu[row] = evictables[len(misses) :] + miss_slots + hit_slots
-
-        self.device_global_indices[:num_tokens] = torch.tensor(
-            dgi_cpu, dtype=torch.int32, device=self.device
-        )
-        self.lru_slots[:num_tokens] = torch.tensor(
-            lru_cpu, dtype=torch.int16, device=self.device
-        )
-
-        if miss_src:
-            src_cpu = torch.tensor(miss_src, dtype=torch.long)
-            dst = torch.tensor(miss_dst, dtype=torch.long, device=self.device)
-            host_valid = self._host_cache_valid[src_cpu]
-            rows = torch.empty(
-                (len(miss_src), self.row_width),
-                dtype=self.kv_dtype,
-                device=self.device,
-            )
-            if torch.any(host_valid):
-                rows[host_valid.to(self.device)] = self._host_cache[
-                    src_cpu[host_valid]
-                ].to(self.device)
-            if not torch.all(host_valid):
-                gpu_src = src_cpu[~host_valid].to(self.device)
-                rows[(~host_valid).to(self.device)] = self._source_cache.index_select(
-                    0, gpu_src
-                )
-            self.hot_cache.index_copy_(0, dst, rows)
 
     # ---------------------------------------------------------- plan replay
 
@@ -1272,12 +1036,7 @@ class HiSparseCoordinator:
             # Not prefetched (overlap off, or host pool not yet bound): gather
             # this layer's misses inline, same path the leader's prefetch uses.
             self.bind_source_cache(kv_cache)
-            if self._kernel_path():
-                self._gather_plan_into(n)
-            else:
-                self._apply_plan_fallback(
-                    self._plan.global_indices[:n], hot_indices, self._plan.miss_mask[:n]
-                )
+            self._gather_plan_into(n)
         if return_valid_counts:
             assert self._plan.valid_counts is not None, (
                 "apply_plan(return_valid_counts=True) requires the group's full "
@@ -1289,36 +1048,6 @@ class HiSparseCoordinator:
                 self._plan.valid_counts[:n],
             )
         return self.hot_cache_paged(block_size), hot_indices
-
-    def _apply_plan_fallback(
-        self,
-        global_indices: torch.Tensor,
-        hot_indices: torch.Tensor,
-        miss_mask: torch.Tensor,
-    ) -> None:
-        """Python reference for hisparse_gather_plan (miss-column gather)."""
-        assert self._source_cache is not None
-        assert self._host_cache is not None and self._host_cache_valid is not None
-        mask = (miss_mask != 0) & (global_indices >= 0) & (hot_indices >= 0)
-        src = global_indices[mask]
-        dst = hot_indices[mask].to(torch.long)
-        if src.numel() == 0:
-            return
-        src_cpu = src.cpu().to(torch.long)
-        host_valid = self._host_cache_valid[src_cpu]
-        rows = torch.empty(
-            (src.numel(), self.row_width), dtype=self.kv_dtype, device=self.device
-        )
-        if torch.any(host_valid):
-            rows[host_valid.to(self.device)] = self._host_cache[
-                src_cpu[host_valid]
-            ].to(self.device)
-        if not torch.all(host_valid):
-            gpu_src = src_cpu[~host_valid].to(self.device)
-            rows[(~host_valid).to(self.device)] = self._source_cache.index_select(
-                0, gpu_src
-            )
-        self.hot_cache.index_copy_(0, dst, rows)
 
 
 def create_hisparse_coordinator(

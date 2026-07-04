@@ -837,9 +837,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
 
 #ifndef USE_ROCM
   ops.def(
-      "hisparse_swap_in(Tensor source_cache,"
-      "                 Tensor host_cache,"
-      "                 Tensor host_cache_valid,"
+      "hisparse_swap_in(Tensor host_cache,"
       "                 Tensor! hot_cache,"
       "                 Tensor global_indices,"
       "                 Tensor? newest_global_indices,"
@@ -852,9 +850,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                 Tensor(b!)? stats=None) -> ()");
 
   ops.def(
-      "hisparse_gather_plan(Tensor source_cache,"
-      "                     Tensor host_cache,"
-      "                     Tensor host_cache_valid,"
+      "hisparse_gather_plan(Tensor host_cache,"
       "                     Tensor! hot_cache,"
       "                     Tensor global_indices,"
       "                     Tensor hot_indices,"
@@ -865,7 +861,6 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "hisparse_backup(Tensor src_cache,"
       "                Tensor src_indices,"
       "                Tensor! host_cache,"
-      "                Tensor! host_cache_valid,"
       "                Tensor dst_slots) -> ()");
 #endif  // !USE_ROCM
 

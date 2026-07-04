@@ -865,6 +865,112 @@ def test_triton_convert_returns_valid_counts():
     torch.testing.assert_close(result_only, result, rtol=0, atol=0)
 
 
+# HiSparse is host-resident-only and kernel-only: coordinator construction
+# raises without the compiled CUDA ops.
+requires_hisparse_ops = pytest.mark.skipif(
+    not _has_hisparse_ops(),
+    reason="HiSparse CUDA ops not compiled (or stale schema)",
+)
+
+
+def fallback_swap_in(
+    coordinator: HiSparseCoordinator,
+    global_indices: torch.Tensor,
+    newest_global: torch.Tensor | None,
+    hot_indices: torch.Tensor,
+    miss_mask: torch.Tensor | None = None,
+) -> None:
+    """Python reference for the hisparse_swap_in kernel semantics.
+
+    Writes resolved slots into ``hot_indices`` in place; when ``miss_mask``
+    is given, sets it to 1 at columns resolved as a miss. Misses are always
+    served from the coordinator's host pool.
+    """
+    assert coordinator._host_cache is not None
+    num_tokens, _ = global_indices.shape
+    buf = coordinator.config.device_buffer_size
+    hot_indices.fill_(-1)
+    if miss_mask is not None:
+        miss_mask.fill_(0)
+
+    global_cpu = global_indices.cpu().tolist()
+    newest_cpu = (
+        newest_global.cpu().tolist()
+        if newest_global is not None
+        else [-1] * num_tokens
+    )
+    dgi_cpu = coordinator.device_global_indices[:num_tokens].cpu().tolist()
+    lru_cpu = coordinator.lru_slots[:num_tokens].cpu().tolist()
+
+    miss_src: list[int] = []
+    miss_dst: list[int] = []
+    for row in range(num_tokens):
+        base = row * coordinator.region_stride
+        slot_of_global = {g: slot for slot, g in enumerate(dgi_cpu[row]) if g >= 0}
+        hit_cols: dict[int, int] = {}
+        for col, g in enumerate(global_cpu[row]):
+            if g < 0:
+                continue
+            if g == newest_cpu[row]:
+                hot_indices[row, col] = base + buf
+            elif g in slot_of_global:
+                hit_cols[slot_of_global[g]] = col
+
+        # Classify slots in LRU order, like the kernel does.
+        evictables = [s for s in lru_cpu[row] if s not in hit_cols]
+        hit_slots = [s for s in lru_cpu[row] if s in hit_cols]
+        for slot in hit_slots:
+            hot_indices[row, hit_cols[slot]] = base + slot
+
+        misses = [
+            (col, g)
+            for col, g in enumerate(global_cpu[row])
+            if g >= 0 and g != newest_cpu[row] and g not in slot_of_global
+        ]
+        miss_slots = []
+        for m, (col, g) in enumerate(misses):
+            slot = evictables[m]
+            miss_slots.append(slot)
+            hot_indices[row, col] = base + slot
+            if miss_mask is not None:
+                miss_mask[row, col] = 1
+            dgi_cpu[row][slot] = g
+            miss_src.append(g)
+            miss_dst.append(base + slot)
+
+        lru_cpu[row] = evictables[len(misses) :] + miss_slots + hit_slots
+
+    coordinator.device_global_indices[:num_tokens] = torch.tensor(
+        dgi_cpu, dtype=torch.int32, device=coordinator.device
+    )
+    coordinator.lru_slots[:num_tokens] = torch.tensor(
+        lru_cpu, dtype=torch.int16, device=coordinator.device
+    )
+
+    if miss_src:
+        src_cpu = torch.tensor(miss_src, dtype=torch.long)
+        dst = torch.tensor(miss_dst, dtype=torch.long, device=coordinator.device)
+        rows = coordinator._host_cache[src_cpu].to(coordinator.device)
+        coordinator.hot_cache.index_copy_(0, dst, rows)
+
+
+def fallback_apply_plan(
+    coordinator: HiSparseCoordinator,
+    global_indices: torch.Tensor,
+    hot_indices: torch.Tensor,
+    miss_mask: torch.Tensor,
+) -> None:
+    """Python reference for hisparse_gather_plan (miss-column gather)."""
+    assert coordinator._host_cache is not None
+    mask = (miss_mask != 0) & (global_indices >= 0) & (hot_indices >= 0)
+    src = global_indices[mask]
+    dst = hot_indices[mask].to(torch.long)
+    if src.numel() == 0:
+        return
+    rows = coordinator._host_cache[src.cpu().to(torch.long)].to(coordinator.device)
+    coordinator.hot_cache.index_copy_(0, dst, rows)
+
+
 def _make_hisparse_vllm_config(index_topk: int = 128):
     return SimpleNamespace(
         attention_config=SimpleNamespace(
@@ -890,6 +996,7 @@ def _make_hisparse_vllm_config(index_topk: int = 128):
     )
 
 
+@requires_hisparse_ops
 def test_hisparse_config_validation():
     vllm_config = _make_hisparse_vllm_config()
 
@@ -952,6 +1059,7 @@ def test_hisparse_disabled_without_flag():
     assert HiSparseConfig.from_vllm_config(vllm_config, model_top_k=128) is None
 
 
+@requires_hisparse_ops
 def test_hisparse_coordinator_is_connector_agnostic():
     # The coordinator itself does not depend on a KV connector; the
     # decode-only (kv_consumer required) deployment contract is enforced by
@@ -1008,14 +1116,6 @@ def _make_hisparse_coordinator(
     )
 
 
-def _mirror_block_slots(coordinator, kv_cache, block_ids, block_size):
-    device = kv_cache.device
-    slots = torch.cat(
-        [torch.arange(block_size) + b * block_size for b in block_ids]
-    ).to(device)
-    coordinator.mirror_slots(kv_cache, slots)
-
-
 def _hisparse_state(coordinator: HiSparseCoordinator):
     return (
         coordinator.device_global_indices.cpu().clone(),
@@ -1023,6 +1123,7 @@ def _hisparse_state(coordinator: HiSparseCoordinator):
     )
 
 
+@requires_hisparse_ops
 def test_hisparse_reset_hot_rows():
     coordinator = _make_hisparse_coordinator(max_num_reqs=3)
     coordinator.device_global_indices.fill_(7)
@@ -1036,21 +1137,18 @@ def test_hisparse_reset_hot_rows():
     torch.testing.assert_close(coordinator.lru_slots[1], coordinator._lru_init)
 
 
+@requires_hisparse_ops
 def test_hisparse_swap_in_semantics():
-    """Hit/miss/LRU/newest semantics of the swap-in path.
-
-    Runs against whichever path is active (CUDA kernels when compiled, Python
-    reference otherwise); both must implement identical semantics.
-    """
+    """Hit/miss/LRU/newest semantics of the swap-in kernel."""
     device = torch.device(DEVICE_TYPE)
     block_size = 4
     row_width = 8
     num_blocks = 8
 
-    kv_cache = torch.arange(
-        num_blocks * block_size * row_width, dtype=torch.float32, device=device
-    ).view(num_blocks, block_size, row_width)
-    flat_kv = kv_cache.reshape(-1, row_width)
+    kv_pool = torch.arange(
+        num_blocks * block_size * row_width, dtype=torch.float32
+    ).view(num_blocks, block_size, row_width).pin_memory()
+    flat_pool = kv_pool.reshape(-1, row_width)
 
     coordinator = _make_hisparse_coordinator()
     buf = coordinator.config.device_buffer_size
@@ -1063,12 +1161,10 @@ def test_hisparse_swap_in_semantics():
     newest_global = 4 * block_size + 0  # slot 16
     slot_mapping = torch.tensor([newest_global], dtype=torch.int64, device=device)
 
-    # Mirror the request's KV into the host cache (as PD-load would).
-    _mirror_block_slots(coordinator, kv_cache, [2, 0, 4], block_size)
     # Place the newest row into the reserved hot slot (as write_newest_rows
-    # would) and mirror it.
+    # would).
     newest_hot_slot = 0 * stride + buf
-    coordinator.hot_cache[newest_hot_slot] = flat_kv[newest_global]
+    coordinator.hot_cache[newest_hot_slot] = flat_pool[newest_global].to(device)
 
     def swap(positions: list[int]) -> torch.Tensor:
         topk = torch.full((1, 4), -1, dtype=torch.int32, device=device)
@@ -1076,7 +1172,7 @@ def test_hisparse_swap_in_semantics():
             positions, dtype=torch.int32, device=device
         )
         hot_cache, hot_indices = coordinator.swap_in(
-            kv_cache=kv_cache,
+            kv_cache=kv_pool,
             req_id_per_token=req_ids,
             block_table=block_table,
             topk_indices=topk,
@@ -1084,6 +1180,7 @@ def test_hisparse_swap_in_semantics():
             slot_mapping=slot_mapping,
         )
         assert hot_cache.shape[1:] == (block_size, row_width)
+        torch.cuda.synchronize()
         return hot_indices
 
     # Step 1: positions 0, 5, 8 -> global slots 8, 1, 16(newest).
@@ -1093,8 +1190,8 @@ def test_hisparse_swap_in_semantics():
     assert hot_cpu[2] == newest_hot_slot, "newest position must map to its slot"
     assert all(0 <= h < buf for h in hot_cpu[:2]), "misses fill LRU slots"
     flat_hot = coordinator.hot_cache
-    torch.testing.assert_close(flat_hot[hot_cpu[0]], flat_kv[8])
-    torch.testing.assert_close(flat_hot[hot_cpu[1]], flat_kv[1])
+    torch.testing.assert_close(flat_hot[hot_cpu[0]].cpu(), flat_pool[8])
+    torch.testing.assert_close(flat_hot[hot_cpu[1]].cpu(), flat_pool[1])
 
     dgi, lru = _hisparse_state(coordinator)
     assert set(dgi[0].tolist()) == {8, 1, -1}
@@ -1112,30 +1209,35 @@ def test_hisparse_swap_in_semantics():
     dgi3, _ = _hisparse_state(coordinator)
     assert set(dgi3[0].tolist()) == {8, 1, 9, 10}
     hot3_cpu = hot3.cpu().tolist()[0]
-    torch.testing.assert_close(flat_hot[hot3_cpu[0]], flat_kv[9])
-    torch.testing.assert_close(flat_hot[hot3_cpu[1]], flat_kv[10])
+    torch.testing.assert_close(flat_hot[hot3_cpu[0]].cpu(), flat_pool[9])
+    torch.testing.assert_close(flat_hot[hot3_cpu[1]].cpu(), flat_pool[10])
     assert hot3_cpu[2] == hot_cpu[0], "hit keeps its slot"
     assert hot3_cpu[3] == hot_cpu[1], "hit keeps its slot"
 
-    # Step 4: invalidation. Rewriting global slot 8 must turn it into a miss
-    # that re-reads the host mirror.
-    flat_kv[8] += 1000.0
-    coordinator.mirror_slots(kv_cache, torch.tensor([8], device=device))
+    # Step 4: invalidation. When global slot 8 is rewritten in the host pool
+    # (block reassignment), the model runner invalidates it; the stale hot
+    # copy must turn into a miss that re-reads the pool.
+    flat_pool[8] += 1000.0
+    coordinator.invalidate_slots(torch.tensor([8], device=device))
     dgi4, _ = _hisparse_state(coordinator)
     assert 8 not in dgi4[0].tolist()
     hot4 = swap([0])
     torch.testing.assert_close(
-        flat_hot[hot4.cpu().tolist()[0][0]], flat_kv[8]
+        flat_hot[hot4.cpu().tolist()[0][0]].cpu(), flat_pool[8]
     )
 
 
+@requires_hisparse_ops
 def test_hisparse_invalidate_slots_drops_recycled_hot_copies():
     device = torch.device(DEVICE_TYPE)
     block_size = 4
     row_width = 8
-    kv_cache = torch.zeros((4, block_size, row_width), device=device)
+    kv_pool = torch.zeros(
+        4, block_size, row_width, dtype=torch.float32
+    ).pin_memory()
+    flat_pool = kv_pool.reshape(-1, row_width)
     coordinator = _make_hisparse_coordinator()
-    coordinator.bind_source_cache(kv_cache)
+    coordinator.bind_source_cache(kv_pool)
 
     # Pretend slot 5 is cached in row 0's hot buffer from an old request.
     # The model runner invalidates every block (re)assigned to a request
@@ -1148,61 +1250,22 @@ def test_hisparse_invalidate_slots_drops_recycled_hot_copies():
     k_pe = torch.randn(1, 1, 2, device=device)
     slot_mapping = torch.tensor([5], dtype=torch.int64, device=device)
     coordinator.write_newest_rows(
-        kv_c, k_pe, kv_cache, slot_mapping, "auto", torch.tensor(1.0, device=device)
+        kv_c, k_pe, kv_pool, slot_mapping, "auto", torch.tensor(1.0, device=device)
     )
+    torch.cuda.synchronize()
 
-    # Newest row landed in the reserved hot slot and the host mirror.
+    # Newest row landed in the reserved hot slot and the host pool.
     newest_slot = coordinator.config.device_buffer_size
     expected = torch.cat([kv_c[0], k_pe[0, 0]])
     torch.testing.assert_close(
         coordinator.hot_cache[newest_slot].cpu(), expected.cpu()
     )
-    assert coordinator._host_cache_valid[5]
-    torch.testing.assert_close(coordinator._host_cache[5], expected.cpu())
-    # The global cache row stays complete for mixed batches / preemption.
-    torch.testing.assert_close(
-        kv_cache.reshape(-1, row_width)[5].cpu(), expected.cpu()
-    )
+    torch.testing.assert_close(flat_pool[5], expected.cpu())
 
 
-def test_hisparse_mirror_slots():
-    device = torch.device(DEVICE_TYPE)
-    block_size = 4
-    row_width = 8
-    kv_cache = torch.arange(
-        8 * block_size * row_width, dtype=torch.float32, device=device
-    ).view(8, block_size, row_width)
-    coordinator = _make_hisparse_coordinator()
-
-    _mirror_block_slots(coordinator, kv_cache, [2, 5], block_size)
-
-    assert coordinator._host_cache is not None
-    assert coordinator._host_cache_valid is not None
-    expected_slots = torch.cat(
-        [
-            torch.arange(2 * block_size, 3 * block_size),
-            torch.arange(5 * block_size, 6 * block_size),
-        ]
-    )
-    assert torch.all(coordinator._host_cache_valid[expected_slots])
-    assert not torch.any(
-        coordinator._host_cache_valid[torch.arange(0, 2 * block_size)]
-    )
-    flat = kv_cache.reshape(-1, row_width)
-    torch.testing.assert_close(
-        coordinator._host_cache[expected_slots],
-        flat[expected_slots.to(device=device)].cpu(),
-        rtol=0,
-        atol=0,
-    )
-
-
-@pytest.mark.skipif(
-    not _has_hisparse_ops(),
-    reason="HiSparse CUDA ops not compiled (or stale schema)",
-)
+@requires_hisparse_ops
 def test_hisparse_kernel_matches_fallback():
-    """Fuzz the CUDA swap-in kernel against the Python reference."""
+    """Fuzz the CUDA swap-in kernel against the local Python reference."""
     device = torch.device(DEVICE_TYPE)
     torch.manual_seed(0)
     block_size = 64
@@ -1212,26 +1275,23 @@ def test_hisparse_kernel_matches_fallback():
     buf = 256
     num_reqs = 4
 
-    kv_cache = torch.randn(
-        (num_blocks, block_size, row_width), dtype=torch.float32, device=device
-    )
-    flat_kv = kv_cache.reshape(-1, row_width)
+    kv_pool = torch.randn(
+        (num_blocks, block_size, row_width), dtype=torch.float32
+    ).pin_memory()
+    flat_pool = kv_pool.reshape(-1, row_width)
 
-    def make(use_cuda: bool) -> HiSparseCoordinator:
+    def make() -> HiSparseCoordinator:
         c = _make_hisparse_coordinator(
             top_k=top_k,
             device_buffer_size=buf,
             max_num_reqs=num_reqs,
             row_width=row_width,
         )
-        c._use_cuda_ops = use_cuda
-        _mirror_block_slots(c, kv_cache, list(range(num_blocks)), block_size)
+        c.bind_source_cache(kv_pool)
         return c
 
-    kernel_c = make(True)
-    fallback_c = make(False)
-    if not kernel_c._kernel_path():
-        pytest.skip("pinned host memory unavailable")
+    kernel_c = make()
+    fallback_c = make()
 
     blocks_per_req = num_blocks // num_reqs
     block_table = (
@@ -1244,6 +1304,7 @@ def test_hisparse_kernel_matches_fallback():
     slot_mapping = (
         block_table[:, -1].to(torch.int64) * block_size + (block_size - 1)
     )
+    newest_global = slot_mapping.to(torch.int32).contiguous()
 
     for step in range(8):
         topk = torch.stack(
@@ -1256,20 +1317,28 @@ def test_hisparse_kernel_matches_fallback():
         topk[:, -1] = -1
         topk[:, 0] = newest_pos
 
-        results = []
-        for c in (kernel_c, fallback_c):
-            hot_cache, hot_indices = c.swap_in(
-                kv_cache=kv_cache,
-                req_id_per_token=req_ids,
-                block_table=block_table,
-                topk_indices=topk.clone(),
-                block_size=block_size,
-                slot_mapping=slot_mapping,
-            )
-            torch.cuda.synchronize()
-            results.append((hot_cache, hot_indices))
+        hot_k, idx_k = kernel_c.swap_in(
+            kv_cache=kv_pool,
+            req_id_per_token=req_ids,
+            block_table=block_table,
+            topk_indices=topk.clone(),
+            block_size=block_size,
+            slot_mapping=slot_mapping,
+        )
+        # Reference path: same conversion swap_in performs, then the local
+        # Python reference resolution.
+        global_indices = triton_convert_req_index_to_global_index(
+            req_ids,
+            block_table,
+            topk.clone(),
+            BLOCK_SIZE=block_size,
+            NUM_TOPK_TOKENS=top_k,
+            BLOCK_N=128 if top_k % 128 == 0 else top_k,
+        )
+        idx_f = torch.full_like(global_indices, -1)
+        fallback_swap_in(fallback_c, global_indices, newest_global, idx_f)
+        torch.cuda.synchronize()
 
-        (hot_k, idx_k), (_, idx_f) = results
         torch.testing.assert_close(idx_k, idx_f, rtol=0, atol=0)
         torch.testing.assert_close(
             kernel_c.device_global_indices, fallback_c.device_global_indices,
@@ -1278,6 +1347,7 @@ def test_hisparse_kernel_matches_fallback():
         torch.testing.assert_close(
             kernel_c.lru_slots, fallback_c.lru_slots, rtol=0, atol=0
         )
+        torch.testing.assert_close(kernel_c.hot_cache, fallback_c.hot_cache)
 
         # Data correctness: every valid hot index holds the right KV row.
         flat_hot = hot_k.reshape(-1, row_width)
@@ -1286,19 +1356,21 @@ def test_hisparse_kernel_matches_fallback():
             req_ids, block_table, topk, block_size, top_k
         )
         newest_mask = topk == newest_pos
-        gathered = flat_hot[idx_k[valid].to(torch.long)]
-        expected = flat_kv[global_ref[valid].to(torch.long)]
+        gathered = flat_hot[idx_k[valid].to(torch.long)].cpu()
+        expected = flat_pool[global_ref[valid].cpu().to(torch.long)]
         # Newest rows are served from the reserved slot, which this test
         # does not populate; exclude them from the data check.
-        data_mask = ~newest_mask[valid]
+        data_mask = ~newest_mask[valid].cpu()
         torch.testing.assert_close(gathered[data_mask], expected[data_mask])
 
 
+@requires_hisparse_ops
 def test_hisparse_plan_once_matches_independent():
     """GLM-5.2 index sharing: a "shared" layer that replays the "full" layer's
     plan via apply_plan must produce the same hot buffer as if it had run
     swap_in independently. Covers the hisparse_gather_plan kernel + the
-    miss_mask plan output, on both the kernel and Python-reference paths.
+    miss_mask plan output; a second replica replays the plan with the local
+    Python reference to keep kernel-vs-reference parity coverage.
     """
     from vllm.v1.attention.backends.mla import hisparse as _hs
 
@@ -1311,17 +1383,16 @@ def test_hisparse_plan_once_matches_independent():
     buf = 256
     num_reqs = 4
 
-    kv_cache = torch.randn(
-        (num_blocks, block_size, row_width), dtype=torch.float32, device=device
-    )
+    kv_pool = torch.randn(
+        (num_blocks, block_size, row_width), dtype=torch.float32
+    ).pin_memory()
 
-    def make(use_cuda: bool) -> HiSparseCoordinator:
+    def make() -> HiSparseCoordinator:
         c = _make_hisparse_coordinator(
             top_k=top_k, device_buffer_size=buf, max_num_reqs=num_reqs,
             row_width=row_width,
         )
-        c._use_cuda_ops = use_cuda
-        _mirror_block_slots(c, kv_cache, list(range(num_blocks)), block_size)
+        c.bind_source_cache(kv_pool)
         return c
 
     blocks_per_req = num_blocks // num_reqs
@@ -1332,43 +1403,44 @@ def test_hisparse_plan_once_matches_independent():
     seq_len = blocks_per_req * block_size
     slot_mapping = block_table[:, -1].to(torch.int64) * block_size + (block_size - 1)
 
-    def run(use_cuda: bool) -> None:
-        # Distinct plan buffers per path so the two runs never clobber.
-        _hs._GROUP_PLANS.clear()
-        producer, shared, indep = make(use_cuda), make(use_cuda), make(use_cuda)
-        if use_cuda and not producer._kernel_path():
-            pytest.skip("pinned host memory unavailable")
-        for step in range(8):
-            topk = torch.stack([
-                torch.randperm(seq_len, device=device)[:top_k].to(torch.int32)
-                for _ in range(num_reqs)
-            ])
-            topk[:, -1] = -1  # padding column
-            kw = dict(
-                kv_cache=kv_cache, req_id_per_token=req_ids,
-                block_table=block_table, block_size=block_size,
-                slot_mapping=slot_mapping,
-            )
-            # full layer produces the plan; independent layer resolves alone.
-            _, idx_full = producer.swap_in(
-                topk_indices=topk.clone(), produce_plan=True, **kw
-            )
-            _, idx_indep = indep.swap_in(topk_indices=topk.clone(), **kw)
-            # shared layer replays the plan (no LRU resolution of its own).
-            _, idx_shared = shared.apply_plan(
-                kv_cache=kv_cache, block_size=block_size, num_tokens=num_reqs
-            )
-            if use_cuda:
-                torch.cuda.synchronize()
-            # Same plan, and the replayed hot buffer == the independent one.
-            torch.testing.assert_close(idx_shared, idx_full, rtol=0, atol=0)
-            torch.testing.assert_close(idx_indep, idx_full, rtol=0, atol=0)
-            torch.testing.assert_close(shared.hot_cache, indep.hot_cache)
+    _hs._GROUP_PLANS.clear()
+    producer, shared, shared_ref, indep = make(), make(), make(), make()
+    for step in range(8):
+        topk = torch.stack([
+            torch.randperm(seq_len, device=device)[:top_k].to(torch.int32)
+            for _ in range(num_reqs)
+        ])
+        topk[:, -1] = -1  # padding column
+        kw = dict(
+            kv_cache=kv_pool, req_id_per_token=req_ids,
+            block_table=block_table, block_size=block_size,
+            slot_mapping=slot_mapping,
+        )
+        # full layer produces the plan; independent layer resolves alone.
+        _, idx_full = producer.swap_in(
+            topk_indices=topk.clone(), produce_plan=True, **kw
+        )
+        _, idx_indep = indep.swap_in(topk_indices=topk.clone(), **kw)
+        # shared layer replays the plan (no LRU resolution of its own),
+        # once via the kernel and once via the Python reference.
+        _, idx_shared = shared.apply_plan(
+            kv_cache=kv_pool, block_size=block_size, num_tokens=num_reqs
+        )
+        fallback_apply_plan(
+            shared_ref,
+            shared_ref._plan.global_indices[:num_reqs],
+            shared_ref._plan.hot_indices[:num_reqs],
+            shared_ref._plan.miss_mask[:num_reqs],
+        )
+        torch.cuda.synchronize()
+        # Same plan, and the replayed hot buffers == the independent one.
+        torch.testing.assert_close(idx_shared, idx_full, rtol=0, atol=0)
+        torch.testing.assert_close(idx_indep, idx_full, rtol=0, atol=0)
+        torch.testing.assert_close(shared.hot_cache, indep.hot_cache)
+        torch.testing.assert_close(shared_ref.hot_cache, indep.hot_cache)
 
-    run(True)
-    run(False)
 
-
+@requires_hisparse_ops
 def test_hisparse_overlap_prefetch_matches_independent():
     """Overlapped prefetch: a full layer prefetching its shared layers'
     gathers on the copy stream yields the same hot buffers as independent
@@ -1380,9 +1452,9 @@ def test_hisparse_overlap_prefetch_matches_independent():
     device = torch.device(DEVICE_TYPE)
     torch.manual_seed(0)
     block_size, row_width, num_blocks, top_k, buf, num_reqs = 64, 64, 64, 128, 256, 4
-    kv_cache = torch.randn(
-        (num_blocks, block_size, row_width), dtype=torch.float32, device=device
-    )
+    kv_pool = torch.randn(
+        (num_blocks, block_size, row_width), dtype=torch.float32
+    ).pin_memory()
     _hs._GROUP_PLANS.clear()
 
     def make() -> HiSparseCoordinator:
@@ -1390,12 +1462,10 @@ def test_hisparse_overlap_prefetch_matches_independent():
             top_k=top_k, device_buffer_size=buf, max_num_reqs=num_reqs,
             row_width=row_width,
         )
-        _mirror_block_slots(c, kv_cache, list(range(num_blocks)), block_size)
+        c.bind_source_cache(kv_pool)
         return c
 
     leader, s1, s2, i1, i2 = make(), make(), make(), make(), make()
-    if not leader._kernel_path():
-        pytest.skip("pinned host memory unavailable")
     for c in (leader, s1, s2):
         c._overlap_enabled = True
         c._copy_stream = _hs._get_copy_stream(device)
@@ -1410,7 +1480,7 @@ def test_hisparse_overlap_prefetch_matches_independent():
     seq_len = blocks_per_req * block_size
     slot_mapping = block_table[:, -1].to(torch.int64) * block_size + (block_size - 1)
     kw = dict(
-        kv_cache=kv_cache, req_id_per_token=req_ids, block_table=block_table,
+        kv_cache=kv_pool, req_id_per_token=req_ids, block_table=block_table,
         block_size=block_size, slot_mapping=slot_mapping,
     )
 
@@ -1423,8 +1493,8 @@ def test_hisparse_overlap_prefetch_matches_independent():
         leader.swap_in(topk_indices=topk.clone(), produce_plan=True, **kw)  # + prefetch
         i1.swap_in(topk_indices=topk.clone(), **kw)
         i2.swap_in(topk_indices=topk.clone(), **kw)
-        s1.apply_plan(kv_cache=kv_cache, block_size=block_size, num_tokens=num_reqs)
-        s2.apply_plan(kv_cache=kv_cache, block_size=block_size, num_tokens=num_reqs)
+        s1.apply_plan(kv_cache=kv_pool, block_size=block_size, num_tokens=num_reqs)
+        s2.apply_plan(kv_cache=kv_pool, block_size=block_size, num_tokens=num_reqs)
         torch.cuda.synchronize()
         torch.testing.assert_close(s1.hot_cache, i1.hot_cache)
         torch.testing.assert_close(s2.hot_cache, i2.hot_cache)
@@ -1497,8 +1567,9 @@ def test_hisparse_host_resident_prefill_write_rows_with_padding():
     torch.testing.assert_close(flat_pool[8], torch.zeros(row_width))
 
 
+@requires_hisparse_ops
 def test_hisparse_host_resident_pool():
-    """Host-resident mode: the pinned KV pool is the only full-size store."""
+    """The pinned host KV pool is the only full-size store."""
     device = torch.device(DEVICE_TYPE)
     block_size = 4
     row_width = 8
@@ -1514,7 +1585,6 @@ def test_hisparse_host_resident_pool():
     stride = coordinator.region_stride
 
     coordinator.bind_source_cache(kv_pool)
-    assert coordinator.source_is_host
     assert coordinator._host_cache.data_ptr() == flat_pool.data_ptr()
 
     block_table = torch.tensor([[2, 0, 4]], dtype=torch.int32, device=device)
@@ -1586,6 +1656,7 @@ def test_hisparse_host_resident_pool():
     )
 
 
+@requires_hisparse_ops
 def test_hisparse_warm_start_rows():
     """Warm-started slots resolve as hits; misses consume empty slots first."""
     device = torch.device(DEVICE_TYPE)
@@ -1599,11 +1670,8 @@ def test_hisparse_warm_start_rows():
     flat_pool = kv_pool.reshape(-1, row_width)
 
     coordinator = _make_hisparse_coordinator()
-    if not coordinator._use_cuda_ops:
-        pytest.skip("warm start requires the HiSparse CUDA ops")
     stride = coordinator.region_stride
     coordinator.bind_source_cache(kv_pool)
-    assert coordinator.source_is_host
 
     # Row 1: partial staging (3 of 4 positions) of context slots 8, 9, 10
     # (block 2, oldest first). Row 0: full staging of slots 4..7 (block 1).

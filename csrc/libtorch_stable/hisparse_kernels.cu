@@ -8,12 +8,12 @@
 // adapted to vLLM addressing:
 //  - tokens are keyed by their global KV slot id (block_table-converted
 //    indexer output) instead of in-request positions, so no per-request
-//    host-location table is needed: host mirror row i caches global slot i.
+//    host-location table is needed: host pool row i is global slot i.
 //  - each batch row owns a fixed region of `region_stride` hot rows;
 //    slots [0, hot_size) are LRU-managed, slot `hot_size` holds the row's
 //    newest token (written directly by the KV-cache update).
 //
-// Both kernels only move bytes; they are dtype agnostic.
+// The kernels only move bytes; they are dtype agnostic.
 
 #include "torch_utils.h"
 #include "ops.h"
@@ -103,9 +103,7 @@ __device__ __forceinline__ int warp_inclusive_scan(int32_t* s_data,
 //   s_lru_out[hot_size]      int16, compacted slots: [hits fwd | evict bwd]
 //   s_hash_vals[hash_size]   int16 hash values (top-k index)
 __global__ void hisparse_swap_in_kernel(
-    const char* __restrict__ source_cache,        // [source_rows, row_bytes]
     const char* __restrict__ host_cache,          // [host_rows, row_bytes]
-    const bool* __restrict__ host_cache_valid,    // [host_rows]
     char* __restrict__ hot_cache,                 // [n_rows*stride, row_bytes]
     const int32_t* __restrict__ global_indices,   // [num_rows, top_k]
     const int32_t* __restrict__ newest_global,    // [num_rows] or nullptr
@@ -115,9 +113,9 @@ __global__ void hisparse_swap_in_kernel(
     int16_t* __restrict__ lru_slots,              // [max_rows, hot_size]
     unsigned long long* __restrict__ stats,       // [2] hits,misses or nullptr
     const int32_t* __restrict__ num_real_reqs,    // [1] or nullptr
-    const int64_t source_rows, const int64_t host_rows,
-    const int64_t row_bytes, const int32_t top_k, const int32_t hot_size,
-    const int32_t hash_size, const int64_t region_stride) {
+    const int64_t host_rows, const int64_t row_bytes, const int32_t top_k,
+    const int32_t hot_size, const int32_t hash_size,
+    const int64_t region_stride) {
   const int NUM_WARPS = blockDim.x / kWarpSize;
   const int num_buffer_chunks = (hot_size + kWarpSize - 1) / kWarpSize;
   const int num_token_chunks = (top_k + kWarpSize - 1) / kWarpSize;
@@ -349,23 +347,17 @@ __global__ void hisparse_swap_in_kernel(
     }
   }
 
-  // Phase 5: copy missed rows, one warp per miss. Prefer the host mirror;
-  // fall back to the full GPU source cache when the row was never mirrored.
+  // Phase 5: copy missed rows from the host pool, one warp per miss.
   for (int m = warp_id; m < total_misses; m += NUM_WARPS) {
     const int32_t g = s_topk[m];
     const int16_t evict_slot = s_lru_out[hot_size - 1 - m];
     char* dst = hot_cache + (hot_base + evict_slot) * row_bytes;
 
-    const char* src = nullptr;
-    if (g < host_rows && host_cache_valid[g]) {
-      src = host_cache + static_cast<int64_t>(g) * row_bytes;
-    } else if (g < source_rows) {
-      src = source_cache + static_cast<int64_t>(g) * row_bytes;
-    }
-    if (src != nullptr) {
-      copy_row_warp(lane_id, src, dst, row_bytes);
+    if (g >= 0 && g < host_rows) {
+      copy_row_warp(lane_id, host_cache + static_cast<int64_t>(g) * row_bytes,
+                    dst, row_bytes);
     } else {
-      // No valid source for g: never serve the evicted slot's stale bytes
+      // No source row for g: never serve the evicted slot's stale bytes
       // as g. Zero the row (deterministic, visible in output quality) and
       // withdraw the phase-3 ownership claim so later steps re-miss instead
       // of hitting the unfilled slot.
@@ -385,16 +377,14 @@ __global__ void hisparse_swap_in_kernel(
 // slot assignment is identical -- only the per-layer bytes differ. Fixed shape
 // (num_rows x top_k), so it is CUDA-graph-capture safe.
 __global__ void hisparse_gather_plan_kernel(
-    const char* __restrict__ source_cache,        // [source_rows, row_bytes]
     const char* __restrict__ host_cache,          // [host_rows, row_bytes]
-    const bool* __restrict__ host_cache_valid,    // [host_rows]
     char* __restrict__ hot_cache,                 // [hot_rows, row_bytes]
     const int32_t* __restrict__ global_indices,   // [num_rows, top_k]
     const int32_t* __restrict__ hot_indices,      // [num_rows, top_k] abs hot rows
     const int32_t* __restrict__ miss_mask,        // [num_rows, top_k]
     const int32_t* __restrict__ num_real_reqs,    // [1] or nullptr
-    const int64_t source_rows, const int64_t host_rows,
-    const int64_t hot_rows, const int64_t row_bytes, const int32_t top_k) {
+    const int64_t host_rows, const int64_t hot_rows, const int64_t row_bytes,
+    const int32_t top_k) {
   const int NUM_WARPS = blockDim.x / kWarpSize;
   // Columns are interleaved across gridDim.y blocks per row so few-row
   // launches (warm-start staging) still fill the device with outstanding
@@ -418,16 +408,11 @@ __global__ void hisparse_gather_plan_kernel(
       continue;
     }
     char* dst_row = hot_cache + static_cast<int64_t>(dst) * row_bytes;
-    const char* src = nullptr;
-    if (g < host_rows && host_cache_valid[g]) {
-      src = host_cache + static_cast<int64_t>(g) * row_bytes;
-    } else if (g < source_rows) {
-      src = source_cache + static_cast<int64_t>(g) * row_bytes;
-    }
-    if (src != nullptr) {
-      copy_row_warp(lane_id, src, dst_row, row_bytes);
+    if (g < host_rows) {
+      copy_row_warp(lane_id, host_cache + static_cast<int64_t>(g) * row_bytes,
+                    dst_row, row_bytes);
     } else {
-      // No valid source for g: zero the planned slot rather than serving
+      // No source row for g: zero the planned slot rather than serving
       // whatever bytes it held (see the swap-in kernel's phase 5).
       zero_row_warp(lane_id, dst_row, row_bytes);
     }
@@ -435,13 +420,13 @@ __global__ void hisparse_gather_plan_kernel(
 }
 
 // One warp per item: gather `src_cache[src_indices[i]]` into
-// `host_cache[dst_slots[i]]` and mark the row valid. Used to mirror KV rows
-// into the pinned host cache fully stream-ordered (no host synchronization).
+// `host_cache[dst_slots[i]]`. Used to scatter KV rows into the pinned host
+// pool fully stream-ordered (no host synchronization).
 __global__ void hisparse_backup_kernel(
     const char* __restrict__ src_cache, const int64_t* __restrict__ src_indices,
-    char* __restrict__ host_cache, bool* __restrict__ host_cache_valid,
-    const int64_t* __restrict__ dst_slots, const int64_t row_bytes,
-    const int32_t num_items, const int64_t src_rows, const int64_t host_rows) {
+    char* __restrict__ host_cache, const int64_t* __restrict__ dst_slots,
+    const int64_t row_bytes, const int32_t num_items, const int64_t src_rows,
+    const int64_t host_rows) {
   const int NUM_WARPS = blockDim.x / kWarpSize;
   const int lane_id = threadIdx.x % kWarpSize;
   const int warp_id = blockIdx.x * NUM_WARPS + threadIdx.x / kWarpSize;
@@ -455,10 +440,6 @@ __global__ void hisparse_backup_kernel(
     }
     copy_row_warp(lane_id, src_cache + s * row_bytes,
                   host_cache + d * row_bytes, row_bytes);
-    __syncwarp();
-    if (lane_id == 0) {
-      host_cache_valid[d] = true;
-    }
   }
 }
 
@@ -473,9 +454,7 @@ int64_t check_2d_rows(const torch::stable::Tensor& t, const char* name,
 
 }  // namespace
 
-void hisparse_swap_in(torch::stable::Tensor const& source_cache,
-                      torch::stable::Tensor const& host_cache,
-                      torch::stable::Tensor const& host_cache_valid,
+void hisparse_swap_in(torch::stable::Tensor const& host_cache,
                       torch::stable::Tensor& hot_cache,
                       torch::stable::Tensor const& global_indices,
                       std::optional<torch::stable::Tensor> const& newest_global_indices,
@@ -486,11 +465,8 @@ void hisparse_swap_in(torch::stable::Tensor const& source_cache,
                       int64_t region_stride,
                       std::optional<torch::stable::Tensor> const& miss_mask,
                       std::optional<torch::stable::Tensor> const& stats) {
-  STD_TORCH_CHECK(source_cache.is_cuda(), "source_cache must be on CUDA");
   STD_TORCH_CHECK(host_cache.device().is_cpu(),
               "host_cache must be CPU memory");
-  STD_TORCH_CHECK(host_cache_valid.device().is_cpu(),
-              "host_cache_valid must be CPU memory");
   STD_TORCH_CHECK(hot_cache.is_cuda(), "hot_cache must be on CUDA");
   STD_TORCH_CHECK(global_indices.is_cuda() && hot_indices.is_cuda() &&
                   device_global_indices.is_cuda() && lru_slots.is_cuda(),
@@ -501,8 +477,6 @@ void hisparse_swap_in(torch::stable::Tensor const& source_cache,
   STD_TORCH_CHECK(device_global_indices.scalar_type() == torch::headeronly::ScalarType::Int,
               "device_global_indices must be int32");
   STD_TORCH_CHECK(lru_slots.scalar_type() == torch::headeronly::ScalarType::Short, "lru_slots must be int16");
-  STD_TORCH_CHECK(host_cache_valid.scalar_type() == torch::headeronly::ScalarType::Bool,
-              "host_cache_valid must be bool");
   STD_TORCH_CHECK(global_indices.dim() == 2 && global_indices.is_contiguous(),
               "global_indices must be contiguous 2D");
   STD_TORCH_CHECK(hot_indices.size(0) == global_indices.size(0) &&
@@ -521,12 +495,7 @@ void hisparse_swap_in(torch::stable::Tensor const& source_cache,
   STD_TORCH_CHECK(row_bytes % 16 == 0, "KV row must be 16-byte aligned");
   auto hot_cache_2d = torch::stable::reshape(hot_cache, {-1, hot_cache.size(-1)});
   const int64_t hot_rows = hot_cache_2d.size(0);
-  auto source_2d = torch::stable::reshape(source_cache, {-1, source_cache.size(-1)});
-  const int64_t source_rows = check_2d_rows(source_2d, "source_cache",
-                                            row_bytes);
   const int64_t host_rows = check_2d_rows(host_cache, "host_cache", row_bytes);
-  STD_TORCH_CHECK(host_cache_valid.numel() >= host_rows,
-              "host_cache_valid has too few rows");
 
   const auto num_rows = static_cast<int32_t>(global_indices.size(0));
   const auto top_k = static_cast<int32_t>(global_indices.size(1));
@@ -559,8 +528,8 @@ void hisparse_swap_in(torch::stable::Tensor const& source_cache,
     num_real_ptr = num_real.const_data_ptr<int32_t>();
   }
 
-  // Optional plan output: 1 at columns resolved as a miss (loaded from
-  // host/source this call), 0 elsewhere. Lets index-sharing "shared" layers
+  // Optional plan output: 1 at columns resolved as a miss (loaded from the
+  // host pool this call), 0 elsewhere. Lets index-sharing "shared" layers
   // replay the same gather via hisparse_gather_plan without re-resolving LRU.
   int32_t* miss_mask_ptr = nullptr;
   if (miss_mask.has_value()) {
@@ -601,30 +570,22 @@ void hisparse_swap_in(torch::stable::Tensor const& source_cache,
                          smem_bytes);
   }
   kernel<<<num_rows, kBlockSize, smem_bytes, stream>>>(
-      static_cast<const char*>(source_2d.const_data_ptr()),
       static_cast<const char*>(host_cache.const_data_ptr()),
-      host_cache_valid.const_data_ptr<bool>(),
       static_cast<char*>(hot_cache_2d.mutable_data_ptr()),
       global_indices.const_data_ptr<int32_t>(), newest_ptr,
       hot_indices.mutable_data_ptr<int32_t>(), miss_mask_ptr,
       device_global_indices.mutable_data_ptr<int32_t>(),
-      lru_slots.mutable_data_ptr<int16_t>(), stats_ptr, num_real_ptr, source_rows,
-      host_rows,
+      lru_slots.mutable_data_ptr<int16_t>(), stats_ptr, num_real_ptr, host_rows,
       row_bytes, top_k, hot_size, hash_size, region_stride);
 }
 
-void hisparse_gather_plan(torch::stable::Tensor const& source_cache,
-                          torch::stable::Tensor const& host_cache,
-                          torch::stable::Tensor const& host_cache_valid,
+void hisparse_gather_plan(torch::stable::Tensor const& host_cache,
                           torch::stable::Tensor& hot_cache,
                           torch::stable::Tensor const& global_indices,
                           torch::stable::Tensor const& hot_indices,
                           torch::stable::Tensor const& miss_mask,
                           std::optional<torch::stable::Tensor> const& num_real_reqs) {
-  STD_TORCH_CHECK(source_cache.is_cuda(), "source_cache must be on CUDA");
   STD_TORCH_CHECK(host_cache.device().is_cpu(), "host_cache must be CPU memory");
-  STD_TORCH_CHECK(host_cache_valid.device().is_cpu(),
-              "host_cache_valid must be CPU memory");
   STD_TORCH_CHECK(hot_cache.is_cuda(), "hot_cache must be on CUDA");
   STD_TORCH_CHECK(global_indices.is_cuda() && hot_indices.is_cuda() &&
                   miss_mask.is_cuda(),
@@ -641,17 +602,11 @@ void hisparse_gather_plan(torch::stable::Tensor const& source_cache,
                   miss_mask.size(1) == global_indices.size(1) &&
                   hot_indices.is_contiguous() && miss_mask.is_contiguous(),
               "hot_indices/miss_mask must match contiguous 2D global_indices");
-  STD_TORCH_CHECK(host_cache_valid.scalar_type() == torch::headeronly::ScalarType::Bool,
-              "host_cache_valid must be bool");
 
   const int64_t row_bytes = hot_cache.size(-1) * hot_cache.element_size();
   STD_TORCH_CHECK(row_bytes % 16 == 0, "KV row must be 16-byte aligned");
   auto hot_cache_2d = torch::stable::reshape(hot_cache, {-1, hot_cache.size(-1)});
-  auto source_2d = torch::stable::reshape(source_cache, {-1, source_cache.size(-1)});
-  const int64_t source_rows = check_2d_rows(source_2d, "source_cache", row_bytes);
   const int64_t host_rows = check_2d_rows(host_cache, "host_cache", row_bytes);
-  STD_TORCH_CHECK(host_cache_valid.numel() >= host_rows,
-              "host_cache_valid has too few rows");
 
   const auto num_rows = static_cast<int32_t>(global_indices.size(0));
   const auto top_k = static_cast<int32_t>(global_indices.size(1));
@@ -685,28 +640,21 @@ void hisparse_gather_plan(torch::stable::Tensor const& source_cache,
   const torch::stable::accelerator::DeviceGuard device_guard(hot_cache.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
   hisparse_gather_plan_kernel<<<grid, kBlockSize, 0, stream>>>(
-      static_cast<const char*>(source_2d.const_data_ptr()),
       static_cast<const char*>(host_cache.const_data_ptr()),
-      host_cache_valid.const_data_ptr<bool>(),
       static_cast<char*>(hot_cache_2d.mutable_data_ptr()),
       global_indices.const_data_ptr<int32_t>(),
       hot_indices.const_data_ptr<int32_t>(),
-      miss_mask.const_data_ptr<int32_t>(), num_real_ptr, source_rows, host_rows,
-      hot_rows, row_bytes, top_k);
+      miss_mask.const_data_ptr<int32_t>(), num_real_ptr, host_rows, hot_rows,
+      row_bytes, top_k);
 }
 
 void hisparse_backup(torch::stable::Tensor const& src_cache,
                      torch::stable::Tensor const& src_indices,
                      torch::stable::Tensor& host_cache,
-                     torch::stable::Tensor& host_cache_valid,
                      torch::stable::Tensor const& dst_slots) {
   STD_TORCH_CHECK(src_cache.is_cuda(), "src_cache must be on CUDA");
   STD_TORCH_CHECK(host_cache.device().is_cpu(),
               "host_cache must be CPU memory");
-  STD_TORCH_CHECK(host_cache_valid.device().is_cpu(),
-              "host_cache_valid must be CPU memory");
-  STD_TORCH_CHECK(host_cache_valid.scalar_type() == torch::headeronly::ScalarType::Bool,
-              "host_cache_valid must be bool");
   STD_TORCH_CHECK(src_indices.is_cuda() && dst_slots.is_cuda(),
               "src_indices/dst_slots must be on CUDA");
   STD_TORCH_CHECK(
@@ -722,8 +670,6 @@ void hisparse_backup(torch::stable::Tensor const& src_cache,
   auto src_2d = torch::stable::reshape(src_cache, {-1, src_cache.size(-1)});
   const int64_t src_rows = src_2d.size(0);
   const int64_t host_rows = check_2d_rows(host_cache, "host_cache", row_bytes);
-  STD_TORCH_CHECK(host_cache_valid.numel() >= host_rows,
-              "host_cache_valid has too few rows");
 
   const auto num_items = static_cast<int32_t>(src_indices.numel());
   if (num_items == 0) {
@@ -740,6 +686,6 @@ void hisparse_backup(torch::stable::Tensor const& src_cache,
       static_cast<const char*>(src_2d.const_data_ptr()),
       src_indices.const_data_ptr<int64_t>(),
       static_cast<char*>(host_cache.mutable_data_ptr()),
-      host_cache_valid.mutable_data_ptr<bool>(), dst_slots.const_data_ptr<int64_t>(),
+      dst_slots.const_data_ptr<int64_t>(),
       row_bytes, num_items, src_rows, host_rows);
 }
