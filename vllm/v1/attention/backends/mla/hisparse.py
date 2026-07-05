@@ -55,7 +55,6 @@ HOT_REGION_ALIGN = 128
 # GPU memory (model load will likely OOM).
 HOT_BUFFER_GPU_WARN_FRACTION = 0.5
 
-
 def is_hisparse_decode_batch(
     *,
     max_query_len: int,
@@ -64,13 +63,11 @@ def is_hisparse_decode_batch(
 ) -> bool:
     return max_query_len == 1 and num_reqs == num_actual_tokens
 
-
 @dataclass(frozen=True)
 class HiSparseConfig:
     top_k: int
     device_buffer_size: int
-    host_to_device_ratio: float
-    host_pool_gib: float | None = None
+    host_pool_gib: float
 
     @classmethod
     def from_vllm_config(
@@ -85,13 +82,12 @@ class HiSparseConfig:
         if raw_config is None:
             raise ValueError(
                 "HiSparse requires attention_config.hisparse_config with "
-                "top_k, device_buffer_size, and host_to_device_ratio."
+                "host_pool_gib (per-rank pinned host pool size)."
             )
 
         known_keys = {
             "top_k",
             "device_buffer_size",
-            "host_to_device_ratio",
             "host_pool_gib",
         }
         unknown_keys = set(raw_config) - known_keys
@@ -105,10 +101,12 @@ class HiSparseConfig:
         # Default matches SGLang's 2x top_k: at exactly top_k the LRU has
         # zero slack and boundary entries thrash between steps.
         device_buffer_size = int(raw_config.get("device_buffer_size", 2 * top_k))
-        # Optional: only used to size the host pool when host_pool_gib is unset.
-        host_to_device_ratio = float(raw_config.get("host_to_device_ratio", 2))
-        host_pool_gib = raw_config.get("host_pool_gib")
-        host_pool_gib = None if host_pool_gib is None else float(host_pool_gib)
+        if raw_config.get("host_pool_gib") is None:
+            raise ValueError(
+                "HiSparse requires hisparse_config.host_pool_gib: size it as "
+                "(usable node RAM - co-tenants) / ranks-per-node."
+            )
+        host_pool_gib = float(raw_config["host_pool_gib"])
 
         if top_k != model_top_k:
             raise ValueError(
@@ -120,10 +118,8 @@ class HiSparseConfig:
                 "HiSparse device_buffer_size must be at least top_k. "
                 f"Got device_buffer_size={device_buffer_size}, top_k={top_k}."
             )
-        if host_to_device_ratio < 1:
-            raise ValueError("HiSparse host_to_device_ratio must be >= 1.")
-        if host_pool_gib is not None and host_pool_gib <= 0:
-            raise ValueError("HiSparse host_pool_gib must be positive when set.")
+        if host_pool_gib <= 0:
+            raise ValueError("HiSparse host_pool_gib must be positive.")
 
         # Hot buffers are allocated eagerly per layer and scale with
         # max_num_seqs; a too-large default (e.g. 1024 seqs on GLM-5.2 at
@@ -140,7 +136,6 @@ class HiSparseConfig:
             return cls(
                 top_k=top_k,
                 device_buffer_size=device_buffer_size,
-                host_to_device_ratio=host_to_device_ratio,
                 host_pool_gib=host_pool_gib,
             )
 
@@ -169,7 +164,6 @@ class HiSparseConfig:
         return cls(
             top_k=top_k,
             device_buffer_size=device_buffer_size,
-            host_to_device_ratio=host_to_device_ratio,
             host_pool_gib=host_pool_gib,
         )
 
@@ -179,7 +173,6 @@ class HiSparseConfig:
 # model runner outside captured regions; read by the swap-in kernel from
 # device memory so graph replays observe the per-step value.
 _NUM_REAL_REQS: dict[torch.device, torch.Tensor] = {}
-
 
 def get_num_real_reqs_tensor(device: torch.device) -> torch.Tensor:
     tensor = _NUM_REAL_REQS.get(device)
@@ -192,14 +185,12 @@ def get_num_real_reqs_tensor(device: torch.device) -> torch.Tensor:
         _NUM_REAL_REQS[device] = tensor
     return tensor
 
-
 # All coordinators register here for telemetry; only full (plan-producing)
 # layers' swap-in counters ever advance.
 _STATS: list["HiSparseCoordinator"] = []
 _STATS_INTERVAL = 2000
 _stats_calls = 0
 _stats_last = (0, 0, 0)
-
 
 def _maybe_log_hisparse_stats() -> None:
     """Log aggregate hot-buffer hit rate + PCIe gather volume periodically.
@@ -237,13 +228,11 @@ def _maybe_log_hisparse_stats() -> None:
         d_misses,
     )
 
-
 def set_num_real_reqs(num_reqs: int) -> None:
     """Called by the model runner before each (real or dummy) forward."""
     for tensor in _NUM_REAL_REQS.values():
         tensor.fill_(num_reqs)
     _maybe_log_hisparse_stats()
-
 
 def _leader_coordinators(
     static_forward_context: dict,
@@ -261,7 +250,6 @@ def _leader_coordinators(
         and coordinator.leader is None
     ]
 
-
 # Persistent pinned staging for the per-step H2D index uploads below
 # (invalidated slots, reset rows). One shared buffer is
 # safe: these uploads run eagerly at batch preparation, never under
@@ -269,7 +257,6 @@ def _leader_coordinators(
 # previous upload's async copy is still reading.
 _PINNED_STAGING: torch.Tensor | None = None
 _PINNED_STAGING_EVENT: torch.cuda.Event | None = None
-
 
 def _pinned_to_device(values: list[int], device: torch.device) -> torch.Tensor:
     """Copy a small int list to ``device`` via pinned staging (grow-on-demand,
@@ -291,7 +278,6 @@ def _pinned_to_device(values: list[int], device: torch.device) -> torch.Tensor:
         _PINNED_STAGING_EVENT = torch.cuda.Event()
     _PINNED_STAGING_EVENT.record(torch.cuda.current_stream(device))
     return out
-
 
 def invalidate_blocks(
     static_forward_context: dict, block_ids: list[int], block_size: int
@@ -316,7 +302,6 @@ def invalidate_blocks(
             slots = (blocks[:, None] * block_size + offsets[None, :]).flatten()
         coordinator.invalidate_slots(slots)
 
-
 def reset_rows(static_forward_context: dict, row_ids: list[int]) -> None:
     """Drop per-row HiSparse hot-buffer state in every layer."""
     if not row_ids:
@@ -326,7 +311,6 @@ def reset_rows(static_forward_context: dict, row_ids: list[int]) -> None:
         if rows is None:
             rows = _pinned_to_device(row_ids, coordinator.device)
         coordinator.reset_hot_rows(rows)
-
 
 def _has_hisparse_ops() -> bool:
     try:
@@ -347,7 +331,6 @@ def _has_hisparse_ops() -> bool:
     # (the host-resident-only signature has no source_cache parameter).
     schema = str(torch.ops._C_cache_ops.hisparse_swap_in.default._schema)
     return "source_cache" not in schema and "stats" in schema
-
 
 class _GroupPlan:
     """Group-shared swap-in plan for GLM-5.2 index sharing.
@@ -377,9 +360,7 @@ class _GroupPlan:
         # counts). None until first produced.
         self.valid_counts: torch.Tensor | None = None
 
-
 _GROUP_PLANS: dict[tuple[str, int, int], _GroupPlan] = {}
-
 
 def _get_group_plan(device: torch.device, max_rows: int, top_k: int) -> _GroupPlan:
     key = (str(device), max_rows, top_k)
@@ -389,9 +370,7 @@ def _get_group_plan(device: torch.device, max_rows: int, top_k: int) -> _GroupPl
         _GROUP_PLANS[key] = plan
     return plan
 
-
 _COPY_STREAMS: dict[str, "torch.cuda.Stream"] = {}
-
 
 def _get_copy_stream(device: torch.device) -> "torch.cuda.Stream":
     """One dedicated copy stream per device, shared across a group's coordinators
@@ -403,7 +382,6 @@ def _get_copy_stream(device: torch.device) -> "torch.cuda.Stream":
         s = torch.cuda.Stream(device=device)
         _COPY_STREAMS[key] = s
     return s
-
 
 class HiSparseCoordinator:
     """Per-layer decode-time hot buffer for sparse MLA KV rows.
@@ -895,7 +873,6 @@ class HiSparseCoordinator:
             )
         return self.hot_cache_paged(block_size), hot_indices
 
-
 def create_hisparse_coordinator(
     vllm_config: VllmConfig,
     model_top_k: int,
@@ -934,13 +911,11 @@ def create_hisparse_coordinator(
     hot_bytes = coordinator.hot_cache.numel() * kv_dtype.itemsize
     logger.info_once(
         "Enabled experimental HiSparse sparse MLA hot buffer: top_k=%d, "
-        "device_buffer_size=%d (region_stride=%d), host_to_device_ratio=%s, "
-        "host_pool_gib=%s, %.1f MiB GPU hot buffer per layer "
-        "(max_num_seqs=%d).",
+        "device_buffer_size=%d (region_stride=%d), host_pool_gib=%s, "
+        "%.1f MiB GPU hot buffer per layer (max_num_seqs=%d).",
         config.top_k,
         config.device_buffer_size,
         coordinator.region_stride,
-        config.host_to_device_ratio,
         config.host_pool_gib,
         hot_bytes / 2**20,
         max_num_reqs,

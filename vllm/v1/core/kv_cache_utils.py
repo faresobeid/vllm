@@ -1320,24 +1320,13 @@ def _is_hisparse_host_layer(layer_name: str) -> bool:
     return ".indexer" not in layer_name
 
 
-def _hisparse_host_pool_bytes(
-    vllm_config: VllmConfig, available_memory: int
-) -> int | None:
+def _hisparse_host_pool_bytes(vllm_config: VllmConfig) -> int | None:
     """Per-rank pinned host budget for HiSparse host-resident KV.
 
-    Two ways to size it (``host_pool_gib`` takes precedence):
-      - ``host_pool_gib``: explicit per-rank GiB. Recommended -- sizes the host
-        pool from host RAM directly, independent of GPU memory.
-      - ``host_to_device_ratio``: multiplier on the GPU KV budget
-        (``available_memory``), matching SGLang's "host = device_pool x ratio"
-        semantics (SGLang: ~5 for 1TB host, ~10 for 2TB).
-    The two knobs are parsed and validated by ``HiSparseConfig.from_vllm_config``
-    -- the single source of truth shared with the per-layer coordinator -- so
-    sizing here cannot drift from the decode path.
-
-    NOTE: the resulting block count is still capped by the GPU indexer budget in
-    ``get_kv_cache_config_from_groups`` (a single shared ``num_blocks``), so for
-    large host pools prefer ``host_pool_gib``.
+    ``host_pool_gib`` is parsed and validated by
+    ``HiSparseConfig.from_vllm_config`` -- the single source of truth shared
+    with the per-layer coordinator -- so sizing here cannot drift from the
+    decode path.
     """
     from vllm.v1.attention.backends.mla.hisparse import HiSparseConfig
 
@@ -1349,9 +1338,7 @@ def _hisparse_host_pool_bytes(
     )
     if config is None:
         return None
-    if config.host_pool_gib is not None:
-        return int(config.host_pool_gib * 2**30)
-    return int(config.host_to_device_ratio * available_memory)
+    return int(config.host_pool_gib * 2**30)
 
 
 def _hisparse_gpu_host_usage_split(
@@ -1421,9 +1408,7 @@ def get_kv_cache_config_from_groups(
         # Special case: all layers have the same type of KV cache but with
         # different hidden sizes. Allocate different amount of memory for each
         # layer based on its hidden size.
-        hisparse_host_budget = _hisparse_host_pool_bytes(
-            vllm_config, available_memory
-        )
+        hisparse_host_budget = _hisparse_host_pool_bytes(vllm_config)
         if hisparse_host_budget is not None:
             specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
             host_page = sum(
@@ -2012,7 +1997,7 @@ def _estimate_max_model_len_from_groups(
     """
     original_max = vllm_config.model_config.max_model_len
     hisparse_host_budget = (
-        _hisparse_host_pool_bytes(vllm_config, available_memory)
+        _hisparse_host_pool_bytes(vllm_config)
         if _hisparse_gpu_host_usage_split(vllm_config, kv_cache_groups) is not None
         else None
     )

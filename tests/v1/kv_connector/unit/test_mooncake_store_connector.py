@@ -106,7 +106,7 @@ def _make_hisparse_vllm_config():
     cfg.attention_config.hisparse_config = {
         "top_k": 64,
         "device_buffer_size": 128,
-        "host_to_device_ratio": 4,
+        "host_pool_gib": 1.0,
     }
     return cfg
 

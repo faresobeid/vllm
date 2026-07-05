@@ -977,7 +977,7 @@ def _make_hisparse_vllm_config(index_topk: int = 128):
             hisparse_config={
                 "top_k": index_topk,
                 "device_buffer_size": 256,
-                "host_to_device_ratio": 2,
+                "host_pool_gib": 1.0,
             },
         ),
         kv_transfer_config=KVTransferConfig(
@@ -1004,8 +1004,7 @@ def test_hisparse_config_validation():
     assert cfg == HiSparseConfig(
         top_k=128,
         device_buffer_size=256,
-        host_to_device_ratio=2,
-        host_pool_gib=None,
+        host_pool_gib=1.0,
     )
     coordinator = create_hisparse_coordinator(
         vllm_config,
@@ -1032,7 +1031,6 @@ def test_hisparse_host_pool_config_option():
     vllm_config.attention_config.hisparse_config = {
         "top_k": 128,
         "device_buffer_size": 256,
-        "host_to_device_ratio": 2,
         "host_pool_gib": 3.5,
     }
 
@@ -1041,7 +1039,6 @@ def test_hisparse_host_pool_config_option():
     assert cfg == HiSparseConfig(
         top_k=128,
         device_buffer_size=256,
-        host_to_device_ratio=2,
         host_pool_gib=3.5,
     )
 
@@ -1052,7 +1049,7 @@ def test_hisparse_disabled_without_flag():
     vllm_config.attention_config.hisparse_config = {
         "top_k": 128,
         "device_buffer_size": 256,
-        "host_to_device_ratio": 2,
+        "host_pool_gib": 1.0,
     }
     # hisparse_config alone must not enable HiSparse.
     assert HiSparseConfig.from_vllm_config(vllm_config, model_top_k=128) is None
@@ -1106,7 +1103,7 @@ def _make_hisparse_coordinator(
         config=HiSparseConfig(
             top_k=top_k,
             device_buffer_size=device_buffer_size,
-            host_to_device_ratio=2,
+            host_pool_gib=1.0,
         ),
         max_num_reqs=max_num_reqs,
         row_width=row_width,
