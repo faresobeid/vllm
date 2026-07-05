@@ -1124,6 +1124,122 @@ class GPUModelRunner(
             self.async_output_copy_stream = stream
         return stream
 
+    def _hisparse_host_resident_layers(self) -> set[str]:
+        """Layer names whose KV tensors live in pinned host memory."""
+        if self.vllm_config.attention_config.hisparse_config is None:
+            return set()
+        layers = set()
+        for name, layer in self.compilation_config.static_forward_context.items():
+            impl = getattr(layer, "impl", None)
+            if getattr(impl, "hisparse_coordinator", None) is not None:
+                layers.add(name)
+        return layers
+
+    def _hisparse_invalidate_new_request_blocks(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Drop HiSparse state for every block (re)assigned this step.
+
+        This is the single invalidation point for recycled blocks: hot-buffer
+        hits are keyed by global slot id, and a row's top-k can only name
+        slots in its own block table, so purging stale hot copies whenever a
+        block is assigned — to a new request, a resumed request, or a running
+        request that grew — keeps every later hit byte-correct.
+        """
+        if self.vllm_config.attention_config.hisparse_config is None:
+            return
+
+        block_ids: list[int] = []
+        for new_req in scheduler_output.scheduled_new_reqs:
+            block_ids.extend(new_req.block_ids[0])
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        for new_block_ids in cached_reqs.new_block_ids:
+            if new_block_ids is not None:
+                block_ids.extend(new_block_ids[0])
+        if not block_ids:
+            return
+
+        from vllm.v1.attention.backends.mla.hisparse import invalidate_blocks
+
+        invalidate_blocks(
+            self.compilation_config.static_forward_context,
+            block_ids,
+            self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size,
+        )
+
+    def _hisparse_reset_batch_rows(self, row_ids: list[int]) -> None:
+        """Reset hot-buffer state for persistent-batch rows being assigned."""
+        if self.vllm_config.attention_config.hisparse_config is None:
+            return
+
+        from vllm.v1.attention.backends.mla.hisparse import reset_rows
+
+        reset_rows(self.compilation_config.static_forward_context, row_ids)
+
+    def _hisparse_set_num_real_reqs(self, num_reqs: int) -> None:
+        """Publish the real (unpadded) request count for the swap-in kernel.
+
+        The HiSparse swap-in kernel skips CUDA-graph padding rows by reading
+        this count from device memory, so it must be set before every (real or
+        dummy) forward — graph replays observe the per-step value.
+        """
+        if self.vllm_config.attention_config.hisparse_config is None:
+            return
+
+        from vllm.v1.attention.backends.mla.hisparse import set_num_real_reqs
+
+        set_num_real_reqs(num_reqs)
+
+    def _hisparse_check_host_memory(
+        self, kv_cache_config, host_resident_layers: set[str]
+    ) -> None:
+        """Fail fast when this rank's pinned host pool cannot fit in RAM.
+
+        Each rank checks only its OWN pool bytes against currently available
+        RAM: peers allocate concurrently, so checking the full-node need
+        against a snapshot that already reflects peers' pins would
+        double-count and spuriously reject fitting configs. A node-wide
+        advisory (total RAM vs all co-located ranks, including PP stages)
+        is emitted once, since a partial cudaHostAlloc failure mid-startup or
+        an OOM-killed co-tenant is much harder to diagnose than this warning.
+        """
+        import psutil
+
+        rank_bytes = sum(
+            t.size
+            for t in kv_cache_config.kv_cache_tensors
+            if all(name in host_resident_layers for name in t.shared_by)
+        )
+        mem = psutil.virtual_memory()
+        if rank_bytes > mem.available * 0.95:
+            raise ValueError(
+                f"HiSparse pinned host pool needs ~{rank_bytes / 2**30:.0f} "
+                f"GiB on this rank but only {mem.available / 2**30:.0f} GiB "
+                "of RAM is available. Lower hisparse_config.host_pool_gib or "
+                "leave headroom for co-tenants (KV stores, orchestrators)."
+            )
+        parallel = self.vllm_config.parallel_config
+        # Conservative per-node rank count: TP peers x PP stages x
+        # locally-hosted DP engines. Over-counts when TP/PP spans nodes,
+        # which is acceptable for a warning.
+        ranks_on_node = (
+            parallel.tensor_parallel_size
+            * parallel.pipeline_parallel_size
+            * max(parallel.data_parallel_size_local, 1)
+        )
+        need = rank_bytes * ranks_on_node
+        if need > mem.total * 0.95 and parallel.rank == 0:
+            logger.warning(
+                "HiSparse pinned host pools may need ~%.0f GiB on this node "
+                "(%d ranks x %.0f GiB) but it has %.0f GiB of RAM total. "
+                "Expect pinned allocation failures; lower "
+                "hisparse_config.host_pool_gib.",
+                need / 2**30,
+                ranks_on_node,
+                rank_bytes / 2**30,
+                mem.total / 2**30,
+            )
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -1141,6 +1257,7 @@ class GPUModelRunner(
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
+        self._hisparse_invalidate_new_request_blocks(scheduler_output)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -1445,6 +1562,26 @@ class GPUModelRunner(
         self.input_batch.condense()
         # Allow attention backend to reorder the batch, potentially
         self._may_reorder_batch(scheduler_output)
+
+        # Reset on the requests' FINAL rows: condense/reorder can
+        # move a just-added request (e.g. short_extend classification swaps it
+        # past the decode region) and per-row hot state does not follow moves.
+        # Rows are safe against async KV receives (e.g. NIXL RDMA) without a
+        # per-connector signal: a receiving request is only admitted after its
+        # receive completes, so its row is reset here, and
+        # _hisparse_invalidate_new_request_blocks dropped stale hot copies of
+        # its (freshly assigned) block slots across all rows. Running requests
+        # moved by condense need no reset: hits are keyed by global slot id
+        # and invalidate_blocks drops recycled slots across all rows, so
+        # inherited entries can only hit on slots whose host-pool bytes are
+        # still valid.
+        if reqs_to_add:
+            self._hisparse_reset_batch_rows(
+                [
+                    self.input_batch.req_id_to_index[req.req_id]
+                    for req in reqs_to_add
+                ]
+            )
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
 
@@ -4306,6 +4443,10 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        # Publish the real request count so the HiSparse swap-in kernel skips
+        # CUDA-graph padding rows (no-op unless HiSparse is enabled).
+        self._hisparse_set_num_real_reqs(num_reqs)
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -5943,6 +6084,10 @@ class GPUModelRunner(
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
 
+            # Match the real forward: only the dummy run's real rows are valid
+            # for the HiSparse swap-in kernel (the rest are graph padding).
+            self._hisparse_set_num_real_reqs(num_reqs)
+
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
                 set_forward_context(
@@ -7039,10 +7184,29 @@ class GPUModelRunner(
             dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
+        host_resident_layers = self._hisparse_host_resident_layers()
+        if host_resident_layers:
+            self._hisparse_check_host_memory(kv_cache_config, host_resident_layers)
+        host_bytes = 0
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         packed_backing: torch.Tensor | None = None
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            if kv_cache_tensor.block_stride > 0:
+            if host_resident_layers and all(
+                name in host_resident_layers for name in kv_cache_tensor.shared_by
+            ):
+                # empty, not zeros: zero-filling a pinned pool of this size is
+                # a serial multi-GB CPU memset per rank (tens of minutes of
+                # apparent boot hang across a node's ranks), and the pool
+                # never needs it — every slot the scheduler hands out is
+                # written before the indexer can select it.
+                tensor = torch.empty(
+                    kv_cache_tensor.size,
+                    dtype=torch.int8,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                host_bytes += kv_cache_tensor.size
+            elif kv_cache_tensor.block_stride > 0:
                 # Allocate once; all packed tensors alias the same backing.
                 if packed_backing is None:
                     packed_backing = torch.zeros(
@@ -7057,6 +7221,13 @@ class GPUModelRunner(
                 )
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
+        if host_bytes:
+            logger.info(
+                "HiSparse host-resident KV: allocated %.1f GiB pinned host "
+                "memory for %d MLA layers.",
+                host_bytes / 2**30,
+                len(host_resident_layers),
+            )
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:

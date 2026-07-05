@@ -954,6 +954,12 @@ class MooncakeStoreWorker:
             "load_async", True
         )
         self.cache_config = vllm_config.cache_config
+        # HiSparse keeps MLA KV in pinned host memory while the indexer KV
+        # stays on the GPU, so registration spans host and device segments.
+        attention_config = getattr(vllm_config, "attention_config", None)
+        self._hisparse_enabled = (
+            getattr(attention_config, "hisparse_config", None) is not None
+        )
         self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
         )
@@ -1127,6 +1133,14 @@ class MooncakeStoreWorker:
         existing stride-based logic in register_kv_caches() produces
         the correct single-segment result (block_len = page_size * num_layers).
         """
+        if self._hisparse_enabled:
+            raise ValueError(
+                "HiSparse host-resident KV is incompatible with "
+                "enable_cross_layers_blocks: MLA layers live in pinned host "
+                "memory while indexer layers stay on the GPU, so they cannot "
+                "share one packed cross-layer tensor. Disable "
+                "enable_cross_layers_blocks for HiSparse deployments."
+            )
         self.register_kv_caches({"__cross_layer__": kv_cache})
 
     def register_kv_caches(
@@ -1152,6 +1166,10 @@ class MooncakeStoreWorker:
         seen_ptrs: set[int] = set()
         addrs: list[int] = []
         block_lens: list[int] = []
+        # Per-segment memory kind, parallel to addrs. CPU (pinned) tensors
+        # register as host segments and GPU tensors as device segments; for
+        # HiSparse this is mixed (host MLA + device indexer).
+        mem_kinds: list[str] = []
 
         for value in kv_caches.values():
             cache = _repr_tensor(value)
@@ -1161,13 +1179,15 @@ class MooncakeStoreWorker:
                 continue
             seen_ptrs.add(base_addr)
             region_len = cache_storage.nbytes()
+            mem_kind = "host" if cache.device.type == "cpu" else "device"
 
             ret = self.store.register_buffer(base_addr, region_len)
             if ret != 0:
                 logger.error(
-                    "register_buffer failed for addr %#x len %d: %d",
+                    "register_buffer failed for addr %#x len %d (%s): %d",
                     base_addr,
                     region_len,
+                    mem_kind,
                     ret,
                 )
 
@@ -1184,17 +1204,23 @@ class MooncakeStoreWorker:
                 # Blocks-first layout (FlashInfer / MLA): one segment.
                 addrs.append(base_addr)
                 block_lens.append(page_size_bytes)
+                mem_kinds.append(mem_kind)
             else:
                 # K/V-first layout (FlashAttn / ROCm): split segments.
                 seg_stride = cache.stride(outer_dims[0]) * el
                 for idx in range(cache.shape[outer_dims[0]]):
                     addrs.append(base_addr + idx * seg_stride)
                     block_lens.append(seg_stride // self.num_blocks)
+                    mem_kinds.append(mem_kind)
 
+        num_host = sum(1 for kind in mem_kinds if kind == "host")
         logger.info(
-            "Registered KV caches: num_groups=%d, num_segments=%d, num_blocks=%d",
+            "Registered KV caches: num_groups=%d, num_segments=%d "
+            "(host=%d, device=%d), num_blocks=%d",
             len(self.token_dbs),
             len(addrs),
+            num_host,
+            len(addrs) - num_host,
             self.num_blocks,
         )
 

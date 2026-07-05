@@ -16,7 +16,11 @@ from vllm.model_executor.layers.attention.mla_attention import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.platform_utils import num_compute_units
-from vllm.utils.torch_utils import is_quantized_kv_cache, np_to_pinned_tensor
+from vllm.utils.torch_utils import (
+    is_quantized_kv_cache,
+    kv_cache_dtype_str_to_dtype,
+    np_to_pinned_tensor,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -26,6 +30,12 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
     SparseMLAAttentionImpl,
+)
+from vllm.v1.attention.backends.mla.hisparse import (
+    FP8_DS_MLA_ROW_BYTES,
+    HiSparseCoordinator,
+    create_hisparse_coordinator,
+    is_hisparse_decode_batch,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
@@ -49,6 +59,42 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 
 logger = init_logger(__name__)
+
+# Overlap group wiring: the coordinator of the most-recently-constructed
+# "full" layer, so the shared layers that follow can attach to it. Per-process
+# (one model per vLLM process); reset implicitly as each full layer is built.
+_HISPARSE_CURRENT_LEADER = None
+
+# Layer-invariant local-prefill staging remap shared by every layer in the
+# forward: single slot keyed by (data_ptr, shape, _version) of the block
+# table, so layers 2..N of a step hit and any in-place table mutation (which
+# bumps _version) invalidates. Local prefill never runs under graph capture,
+# so table contents always change through version-bumping host-side writes.
+_HISPARSE_PREFILL_REMAP: tuple | None = None
+
+
+def hisparse_prefill_staging_remap(
+    block_table: torch.Tensor, block_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compact a block table onto its unique referenced blocks.
+
+    Returns ``(new_bt, row_ids)``: ``new_bt`` renumbers the table against a
+    staged copy holding only the unique blocks, and ``row_ids`` is the
+    ``[1, n_unique * block_size]`` int32 host-pool row ids to stage, in
+    staged order. Callers bound the table to each row's used blocks first;
+    out-of-range entries map to block 0, which consumers never read past
+    ``seq_len`` (``clamp(min=0)`` covers synthetic tables with ``-1``
+    padding).
+    """
+    unique_ids, inverse = torch.unique(
+        block_table.clamp(min=0), return_inverse=True
+    )
+    new_bt = inverse.to(torch.int32)
+    row_ids = (
+        unique_ids.to(torch.int32).unsqueeze(1) * block_size
+        + torch.arange(block_size, dtype=torch.int32, device=block_table.device)
+    ).view(1, -1)
+    return new_bt, row_ids
 
 # For FP8 sparse attention we have two implementations:
 # 1. Mixed batch mode: use the FP8 decode kernel for both prefill and decode this is
@@ -156,6 +202,7 @@ class FlashMLASparseMetadata(AttentionMetadata):
 
     block_table: torch.Tensor
     req_id_per_token: torch.Tensor
+    seq_lens: torch.Tensor
     block_size: int = 64
     topk_tokens: int = 2048
 
@@ -528,6 +575,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             slot_mapping=cm.slot_mapping,
             block_table=cm.block_table_tensor,
             req_id_per_token=req_id_per_token,
+            seq_lens=cm.seq_lens,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
             fp8_extra_metadata=fp8_extra_metadata,
@@ -574,6 +622,40 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         self.topk_indices_buffer: torch.Tensor | None = (
             indexer.topk_indices_buffer if indexer is not None else topk_indices_buffer
         )
+        self.hisparse_coordinator: HiSparseCoordinator | None = None
+        attention_config = get_current_vllm_config().attention_config
+        if attention_config.hisparse_config is not None:
+            if kv_cache_dtype == "fp8_ds_mla":
+                hisparse_row_width = FP8_DS_MLA_ROW_BYTES
+                hisparse_kv_dtype = torch.uint8
+            else:
+                hisparse_row_width = head_size
+                hisparse_kv_dtype = kv_cache_dtype_str_to_dtype(
+                    kv_cache_dtype, get_current_vllm_config().model_config
+                )
+            model_top_k = (
+                indexer.topk_tokens
+                if indexer is not None
+                else get_current_vllm_config().model_config.hf_config.index_topk
+            )
+            self.hisparse_coordinator = create_hisparse_coordinator(
+                get_current_vllm_config(),
+                model_top_k,
+                row_width=hisparse_row_width,
+                kv_dtype=hisparse_kv_dtype,
+            )
+            # Index sharing (GLM-5.2): a layer with an indexer is a "full"
+            # layer and leads a group; the indexer-less "shared" layers that
+            # follow (until the next full layer) replay its plan. For models
+            # without index sharing every layer has an indexer, so all groups
+            # stay empty and no plan is produced.
+            global _HISPARSE_CURRENT_LEADER
+            if indexer is not None:
+                _HISPARSE_CURRENT_LEADER = self.hisparse_coordinator
+            elif _HISPARSE_CURRENT_LEADER is not None:
+                self.hisparse_coordinator.join_group(_HISPARSE_CURRENT_LEADER)
+        self._hisparse_decode_batch = False
+        self._hisparse_dummy_batch = False
         # Prefill BF16 kernel requires 64 on Hopper, 128 on Blackwell
         self.prefill_padding = (
             128 if current_platform.is_device_capability_family(100) else 64
@@ -607,6 +689,163 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 (q_concat_shape, torch.bfloat16),
             )
 
+    def prepare_hisparse_for_batch(
+        self,
+        attn_metadata: FlashMLASparseMetadata | None,
+    ) -> None:
+        # Dummy runs (memory profiling, warmup) carry no attention metadata
+        # but still execute the KV-cache-update op with an all -1 slot
+        # mapping; do_kv_cache_update must no-op for them.
+        self._hisparse_dummy_batch = attn_metadata is None
+        if attn_metadata is None:
+            self._hisparse_decode_batch = False
+            return
+        self._hisparse_decode_batch = (
+            self.hisparse_coordinator is not None
+            and is_hisparse_decode_batch(
+                max_query_len=attn_metadata.max_query_len,
+                num_reqs=attn_metadata.num_reqs,
+                num_actual_tokens=attn_metadata.num_actual_tokens,
+            )
+        )
+
+    def _hisparse_swap_in(
+        self,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+        num_decode_tokens: int | None = None,
+        return_valid_counts: bool = False,
+    ):
+        assert self.hisparse_coordinator is not None
+        pure_decode = num_decode_tokens is None
+        n = topk_indices.shape[0] if pure_decode else num_decode_tokens
+        # Index-sharing "shared" layer: replay the leader's plan (produced by
+        # its swap_in earlier this pass) instead of re-resolving the LRU.
+        if self.hisparse_coordinator.leader is not None:
+            return self.hisparse_coordinator.apply_plan(
+                kv_cache=kv_c_and_k_pe_cache,
+                block_size=attn_metadata.block_size,
+                num_tokens=n,
+                return_valid_counts=return_valid_counts,
+            )
+        return self.hisparse_coordinator.swap_in(
+            kv_cache=kv_c_and_k_pe_cache,
+            req_id_per_token=attn_metadata.req_id_per_token[:n],
+            block_table=attn_metadata.block_table,
+            topk_indices=topk_indices[:n],
+            block_size=attn_metadata.block_size,
+            slot_mapping=attn_metadata.slot_mapping if pure_decode else None,
+            return_valid_counts=return_valid_counts,
+            produce_plan=bool(self.hisparse_coordinator.group_shared),
+        )
+
+    def _hisparse_host_prefill_cache(
+        self,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stage the referenced context blocks from the host pool onto GPU.
+
+        Local prefill on a host-resident instance: sparse prefill attention
+        needs the context on GPU, so gather the unique blocks each row
+        actually uses (per ``seq_lens``; tail columns hold stale ids from
+        previous row occupants) host->GPU and renumber the table against the
+        staged copy. The backup kernel is stream-ordered, so freshly written
+        host rows are visible. The gather reads the pinned pool directly on
+        the GPU (hisparse_gather_plan) instead of CPU-indexing the whole
+        padded table, and the index remap — identical for every layer — is
+        cached per (block table identity, mutation version).
+        """
+        global _HISPARSE_PREFILL_REMAP
+        device = block_table.device
+        block_size = kv_c_and_k_pe_cache.shape[1]
+        row_width = kv_c_and_k_pe_cache.shape[-1]
+        key = (block_table.data_ptr(), block_table.shape, block_table._version)
+        cached = _HISPARSE_PREFILL_REMAP
+        if cached is not None and cached[0] == key:
+            _, new_bt, row_ids, dst_rows, miss_mask = cached
+        else:
+            used = (seq_lens.to(torch.int64) + block_size - 1) // block_size
+            bounded = torch.where(
+                torch.arange(block_table.shape[1], device=device)[None, :]
+                < used[:, None],
+                block_table,
+                0,
+            )
+            new_bt, row_ids = hisparse_prefill_staging_remap(
+                bounded, block_size
+            )
+            dst_rows = torch.arange(
+                row_ids.shape[1], dtype=torch.int32, device=device
+            ).view(1, -1)
+            miss_mask = torch.ones_like(row_ids)
+            _HISPARSE_PREFILL_REMAP = (key, new_bt, row_ids, dst_rows, miss_mask)
+
+        staged = torch.empty(
+            (row_ids.shape[1] // block_size, block_size, row_width),
+            dtype=kv_c_and_k_pe_cache.dtype,
+            device=device,
+        )
+        staged_2d = staged.view(-1, row_width)
+        torch.ops._C_cache_ops.hisparse_gather_plan(
+            kv_c_and_k_pe_cache.view(-1, row_width),
+            staged_2d,
+            row_ids,
+            dst_rows,
+            miss_mask,
+            None,
+        )
+        return staged, new_bt
+
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+    ) -> None:
+        if self.hisparse_coordinator is None:
+            return super().do_kv_cache_update(
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                slot_mapping,
+                kv_cache_dtype,
+                k_scale,
+            )
+
+        if self._hisparse_dummy_batch:
+            # Dummy run: nothing to write (slot mapping is all -1).
+            return
+
+        if not self._hisparse_decode_batch:
+            # Local prefill on this instance (router shortcut for short
+            # suffixes, preemption resume, recompute after a failed KV
+            # load): write the rows straight to the host pool. Slower than
+            # PD prefill; correct either way.
+            self.hisparse_coordinator.write_rows_to_host(
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                slot_mapping,
+                kv_cache_dtype,
+                k_scale,
+            )
+            return
+
+        self.hisparse_coordinator.write_newest_rows(
+            kv_c_normed,
+            k_pe,
+            kv_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+        )
+
     def _forward_bf16_kv(
         self,
         q: torch.Tensor,
@@ -614,11 +853,37 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         topk_indices: torch.Tensor,
         attn_metadata: FlashMLASparseMetadata,
     ) -> torch.Tensor:
+        # Set by prepare_hisparse_for_batch on the same metadata this step
+        # (q is already sliced to num_actual_tokens; dummy runs never reach
+        # the forward paths).
+        if self._hisparse_decode_batch:
+            kv_c_and_k_pe_cache, topk_indices, topk_length = self._hisparse_swap_in(
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                attn_metadata,
+                return_valid_counts=True,
+            )
+            return self._bf16_flash_mla_kernel(
+                q,
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                topk_length,
+            )
+
+        block_table = attn_metadata.block_table
+        if kv_c_and_k_pe_cache.device.type == "cpu":
+            # Host-resident pool + local prefill: stage the context on GPU.
+            kv_c_and_k_pe_cache, block_table = self._hisparse_host_prefill_cache(
+                kv_c_and_k_pe_cache,
+                block_table,
+                attn_metadata.seq_lens,
+            )
+
         # Convert per-request indices to global slots (decode) or workspace
         # offsets (prefill).
         topk_indices, topk_length = triton_convert_req_index_to_global_index(
             attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
+            block_table,
             topk_indices,
             BLOCK_SIZE=attn_metadata.block_size,
             NUM_TOPK_TOKENS=topk_indices.shape[1],
@@ -642,6 +907,21 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         fp8_metadata = attn_metadata.fp8_extra_metadata
         assert isinstance(fp8_metadata, FlashMLASparseMetadata.FP8SeparatePrefillDecode)
         num_decodes = fp8_metadata.num_decodes
+        num_decode_tokens = fp8_metadata.num_decode_tokens
+        num_prefill_tokens = fp8_metadata.num_prefill_tokens
+
+        decode_cache = kv_c_and_k_pe_cache
+        decode_topk: torch.Tensor | None = None
+        use_hisparse = self.hisparse_coordinator is not None
+        if use_hisparse and num_decode_tokens > 0:
+            decode_cache, decode_topk = self._hisparse_swap_in(
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                attn_metadata,
+                num_decode_tokens=(
+                    None if num_prefill_tokens == 0 else num_decode_tokens
+                ),
+            )
 
         prefill_request_ids = None
         prefill_workspace_starts = None
@@ -657,17 +937,19 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         # For BF16 cache: always use global cache slots (no workspace)
         # prefill_workspace_starts has been adjusted in-place per chunk so
         # prefill indices automatically come out chunk-local
-        topk_indices, topk_length = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
-            HAS_PREFILL_WORKSPACE=has_prefill_workspace,
-            prefill_workspace_request_ids=prefill_request_ids,
-            prefill_workspace_starts=prefill_workspace_starts,
-            return_valid_counts=True,
-        )
+        topk_length = None
+        if num_prefill_tokens > 0 or not use_hisparse:
+            topk_indices, topk_length = triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token,
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+                HAS_PREFILL_WORKSPACE=has_prefill_workspace,
+                prefill_workspace_request_ids=prefill_request_ids,
+                prefill_workspace_starts=prefill_workspace_starts,
+                return_valid_counts=True,
+            )
 
         fp8_metadata = attn_metadata.fp8_extra_metadata
         assert isinstance(fp8_metadata, FlashMLASparseMetadata.FP8SeparatePrefillDecode)
@@ -686,7 +968,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             assert fp8_metadata.decode is not None
             attn_out, _ = self._fp8_flash_mla_kernel(
                 q=q,
-                kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
+                kv_c_and_k_pe_cache=decode_cache,
                 topk_indices=topk_indices,
                 kernel_metadata=fp8_metadata.decode.kernel_metadata,
             )
@@ -694,13 +976,11 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             #              -> (num_decode_tokens, num_heads, head_dim_v)
             return reshape_attn_output_for_spec_decode(attn_out)
 
-        num_decode_tokens = fp8_metadata.num_decode_tokens
-        num_prefill_tokens = fp8_metadata.num_prefill_tokens
-
         # Pure decode: direct call without allocation
         if num_decode_tokens > 0 and num_prefill_tokens == 0:
             assert fp8_metadata.decode is not None
-            attn_out = _fp8_decode(q, topk_indices)
+            attn_out = _fp8_decode(q, decode_topk if decode_topk is not None
+                                   else topk_indices)
         else:
             # Mixed or pure prefill: allocate output tensor
             attn_out = q.new_empty(
@@ -712,16 +992,25 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             if num_decode_tokens > 0:
                 attn_out[:num_decode_tokens] = _fp8_decode(
                     q[:num_decode_tokens],
-                    topk_indices[:num_decode_tokens],
+                    decode_topk
+                    if decode_topk is not None
+                    else topk_indices[:num_decode_tokens],
                 )
 
             assert fp8_metadata.prefill is not None
+            host_resident = use_hisparse and kv_c_and_k_pe_cache.device.type == "cpu"
             for chunk in fp8_metadata.prefill.chunks:
                 chunk_workspace = self.prefill_bf16_workspace[: chunk.chunk_tot_seqlen]
+                if host_resident:
+                    gather_cache, gather_bt = self._hisparse_host_prefill_cache(
+                        kv_c_and_k_pe_cache, chunk.block_table, chunk.seq_lens
+                    )
+                else:
+                    gather_cache, gather_bt = kv_c_and_k_pe_cache, chunk.block_table
                 ops.cp_gather_and_upconvert_fp8_kv_cache(
-                    kv_c_and_k_pe_cache,
+                    gather_cache,
                     chunk_workspace,
-                    chunk.block_table,
+                    gather_bt,
                     chunk.seq_lens,
                     chunk.workspace_starts,
                     len(chunk.block_table),
@@ -729,6 +1018,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
 
                 chunk_q = q[chunk.tokens_slice]
                 chunk_topk_indices_workspace = topk_indices[chunk.tokens_slice]
+                assert topk_length is not None
                 chunk_topk_length = topk_length[chunk.tokens_slice]
 
                 attn_out[chunk.tokens_slice] = self._bf16_flash_mla_kernel(
@@ -753,11 +1043,41 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         prefill kernel which has head padding overhead when num_heads is small.
         Used when use_mixed_batch is True.
         """
+        # Set by prepare_hisparse_for_batch on the same metadata this step.
+        if self._hisparse_decode_batch:
+            kv_c_and_k_pe_cache, topk_indices = self._hisparse_swap_in(
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                attn_metadata,
+            )
+            assert attn_metadata.fp8_extra_metadata is not None
+            assert isinstance(
+                attn_metadata.fp8_extra_metadata,
+                FlashMLASparseMetadata.FP8KernelMetadata,
+            )
+            fp8_metadata = attn_metadata.fp8_extra_metadata
+            _attn_out, _ = self._fp8_flash_mla_kernel(
+                q=q.unsqueeze(0),
+                kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
+                topk_indices=topk_indices.unsqueeze(0),
+                kernel_metadata=fp8_metadata,
+            )
+            return _attn_out.squeeze(0)
+
+        block_table = attn_metadata.block_table
+        if kv_c_and_k_pe_cache.device.type == "cpu":
+            # Host-resident pool + local prefill: stage the context on GPU.
+            kv_c_and_k_pe_cache, block_table = self._hisparse_host_prefill_cache(
+                kv_c_and_k_pe_cache,
+                block_table,
+                attn_metadata.seq_lens,
+            )
+
         # Convert per-request indices to global slots (decode) or workspace
         # offsets (prefill).
         topk_indices = triton_convert_req_index_to_global_index(
             attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
+            block_table,
             topk_indices,
             BLOCK_SIZE=attn_metadata.block_size,
             NUM_TOPK_TOKENS=topk_indices.shape[1],
