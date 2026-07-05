@@ -532,6 +532,18 @@ class SpecDecodeBaseProposer:
         # and read the indices that step 0 just wrote into the shared buffer.
         if self._share_mtp_indices and hasattr(self.model.model, "set_skip_topk"):
             self.model.model.set_skip_topk(True)
+            # Step 0 wrote one row per FLATTENED token (variable tokens per
+            # request after prefill or accepted drafts), but the loop steps
+            # read rows [0, batch_size) positionally — request b would get
+            # the top-k of flattened token b, i.e. some other request's row,
+            # translated through its own block table into arbitrary KV.
+            # Gather each request's sampled-token row to the front. The RHS
+            # advanced index materializes before assignment, so the overlap
+            # is safe; this runs eagerly between forwards, never captured.
+            if hasattr(self.model.model, "topk_indices_buffer"):
+                buffer = self.model.model.topk_indices_buffer
+                num_sampled = token_indices_to_sample.shape[0]
+                buffer[:num_sampled] = buffer[token_indices_to_sample]
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
 
