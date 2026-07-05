@@ -62,8 +62,7 @@ class AttentionConfig:
     hisparse_config: dict[str, Any] | None = None
     """HiSparse configuration. Expected keys are top_k, device_buffer_size,
     and host_to_device_ratio. host_pool_gib optionally overrides the host pool
-    budget; warm_start preloads a new request's newest context rows into its
-    hot buffers."""
+    budget."""
 
     use_non_causal: bool = False
     """Whether to use non-causal (bidirectional) attention."""

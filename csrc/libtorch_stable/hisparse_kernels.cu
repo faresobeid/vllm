@@ -387,8 +387,9 @@ __global__ void hisparse_gather_plan_kernel(
     const int32_t top_k) {
   const int NUM_WARPS = blockDim.x / kWarpSize;
   // Columns are interleaved across gridDim.y blocks per row so few-row
-  // launches (warm-start staging) still fill the device with outstanding
-  // host reads instead of starving on one block per row.
+  // launches (local-prefill staging's single-row layout, small decode
+  // batches) still fill the device with outstanding host reads instead of
+  // starving on one block per row.
   const int row = blockIdx.x;
   if (num_real_reqs != nullptr && row >= num_real_reqs[0]) {
     return;
@@ -630,7 +631,8 @@ void hisparse_gather_plan(torch::stable::Tensor const& host_cache,
   constexpr int kBlockSize = 1024;
   constexpr int kNumWarps = kBlockSize / kWarpSize;
   // Interleave columns over enough blocks per row to cover the device even
-  // for few-row launches (warm-start staging), keeping >= 1 column per warp.
+  // for few-row launches (local-prefill staging's single-row layout, small
+  // decode batches), keeping >= 1 column per warp.
   constexpr int kTargetBlocks = 256;
   const int max_chunks = std::max(1, (top_k + kNumWarps - 1) / kNumWarps);
   const int num_chunks =

@@ -1184,25 +1184,6 @@ class GPUModelRunner(
 
         reset_rows(self.compilation_config.static_forward_context, row_ids)
 
-    def _hisparse_warm_start(
-        self, row_ids: list[int], requests: list[CachedRequestState]
-    ) -> None:
-        """Stage new requests' newest context rows into their hot buffers."""
-        attention_config = self.vllm_config.attention_config
-        if attention_config is None or not attention_config.enable_hisparse:
-            return
-        if not row_ids:
-            return
-
-        from vllm.v1.attention.backends.mla.hisparse import warm_start_requests
-
-        warm_start_requests(
-            self.compilation_config.static_forward_context,
-            row_ids,
-            [(req.block_ids[0], req.num_computed_tokens) for req in requests],
-            self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size,
-        )
-
     def _hisparse_set_num_real_reqs(self, num_reqs: int) -> None:
         """Publish the real (unpadded) request count for the swap-in kernel.
 
@@ -1582,11 +1563,8 @@ class GPUModelRunner(
 
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
-        hisparse_new_reqs: list[CachedRequestState] = []
         for request in reqs_to_add:
             self.input_batch.add_request(request)
-            if request.req_id in self.input_batch.req_id_to_index:
-                hisparse_new_reqs.append(request)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
         # Condense the batched states if there are gaps left by removed requests
@@ -1594,7 +1572,7 @@ class GPUModelRunner(
         # Allow attention backend to reorder the batch, potentially
         self._may_reorder_batch(scheduler_output)
 
-        # Reset + warm-start on the requests' FINAL rows: condense/reorder can
+        # Reset on the requests' FINAL rows: condense/reorder can
         # move a just-added request (e.g. short_extend classification swaps it
         # past the decode region) and per-row hot state does not follow moves.
         # Rows are safe against async KV receives (NIXL RDMA, Mooncake store
@@ -1602,13 +1580,13 @@ class GPUModelRunner(
         # admitted after its receive completes, so its row is reset here, and
         # _hisparse_invalidate_new_request_blocks dropped stale hot copies of
         # its (freshly assigned) block slots across all rows.
-        if hisparse_new_reqs:
-            hisparse_new_rows = [
-                self.input_batch.req_id_to_index[req.req_id]
-                for req in hisparse_new_reqs
-            ]
-            self._hisparse_reset_batch_rows(hisparse_new_rows)
-            self._hisparse_warm_start(hisparse_new_rows, hisparse_new_reqs)
+        if reqs_to_add:
+            self._hisparse_reset_batch_rows(
+                [
+                    self.input_batch.req_id_to_index[req.req_id]
+                    for req in reqs_to_add
+                ]
+            )
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
 
