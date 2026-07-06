@@ -851,6 +851,115 @@ class VllmConfig:
             "expandable_segments is automatically disabled)."
         )
 
+    def _verify_hisparse_compat(self) -> None:
+        """Validate HiSparse host-resident KV deployment constraints."""
+        if (
+            self.attention_config is None
+            or self.attention_config.hisparse_config is None
+        ):
+            return
+        # PD-decode instances (KV arrives via a consumer connector) are
+        # the intended fast path. Local prefill also works — rows are
+        # written to the host pool and prefill attention stages the
+        # context host->GPU — but it is slower than a normal GPU prefill,
+        # so warn when the deployment will prefill routinely.
+        if (
+            self.kv_transfer_config is None
+            or not self.kv_transfer_config.is_kv_consumer
+        ):
+            logger.warning(
+                "HiSparse host-resident KV is enabled without a "
+                "kv_consumer connector (unified / non-PD instance). "
+                "Every prefill gathers KV from host memory, which is "
+                "slower than a normal GPU prefill; PD decode-only "
+                "instances avoid this cost."
+            )
+        if self.parallel_config.use_ubatching:
+            raise ValueError(
+                "HiSparse does not support DBO/ubatching: micro-batches "
+                "would index the same hot-buffer rows concurrently and "
+                "corrupt the LRU state."
+            )
+        if self.speculative_config is not None:
+            spec = self.speculative_config
+            draft_hf = (
+                spec.draft_model_config.hf_config
+                if spec.draft_model_config is not None
+                else None
+            )
+            if spec.method != "mtp":
+                raise ValueError(
+                    "HiSparse only supports MTP speculative decoding; "
+                    f"got method={spec.method!r}."
+                )
+            if draft_hf is None or not hasattr(draft_hf, "index_topk"):
+                raise ValueError(
+                    "HiSparse MTP requires a DSA draft (draft hf_config "
+                    "with index_topk)."
+                )
+            if not getattr(
+                draft_hf, "index_share_for_mtp_iteration", False
+            ):
+                raise ValueError(
+                    "HiSparse MTP requires index_share_for_mtp_iteration "
+                    "on the draft config: without it, draft iterations "
+                    "re-run the indexer and can select speculative "
+                    "positions whose host-pool bytes are rewritten on "
+                    "rejection — the draft hot buffer would serve stale "
+                    "rows."
+                )
+            if spec.parallel_drafting:
+                raise ValueError(
+                    "HiSparse MTP does not support parallel_drafting "
+                    "(it breaks the uniform verify-batch geometry)."
+                )
+            if spec.disable_padded_drafter_batch:
+                raise ValueError(
+                    "HiSparse MTP requires the padded drafter batch "
+                    "(disable_padded_drafter_batch=False)."
+                )
+            if getattr(draft_hf, "num_nextn_predict_layers", 1) != 1:
+                raise ValueError(
+                    "HiSparse MTP assumes a single nextn layer (one "
+                    "shared draft top-k buffer)."
+                )
+        if self.model_config is not None and not hasattr(
+            self.model_config.hf_config, "index_topk"
+        ):
+            raise ValueError(
+                "HiSparse is only supported for DSA models with "
+                "index_topk."
+            )
+        if self.kv_transfer_config is not None and (
+            self.kv_transfer_config.kv_connector
+            not in (
+                None,
+                "NixlConnector",
+                "MooncakeStoreConnector",
+                "MultiConnector",
+            )
+        ):
+            logger.warning(
+                "HiSparse host-resident KV is configured with connector "
+                "%s. NixlConnector (direct-to-host RDMA) and "
+                "MooncakeStoreConnector (shared-store offload) are the "
+                "validated paths; other connectors are treated as "
+                "debug/fallback paths.",
+                self.kv_transfer_config.kv_connector,
+            )
+
+        from vllm.v1.attention.backends.mla.hisparse import (
+            _has_hisparse_ops,
+        )
+
+        if not _has_hisparse_ops():
+            raise RuntimeError(
+                "HiSparse requires the compiled CUDA ops "
+                "(_C_cache_ops.hisparse_*), which are missing from this "
+                "build. Rebuild vLLM from source with CUDA."
+            )
+
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -1168,6 +1277,8 @@ class VllmConfig:
             )
 
         self._maybe_override_dynamic_sd_cudagraph_mode()
+
+        self._verify_hisparse_compat()
 
         if (
             self.compilation_config.cudagraph_mode.requires_piecewise_compilation()

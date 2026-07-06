@@ -85,6 +85,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             )
         else:
             topk_indices_buffer = None
+        self.topk_indices_buffer = topk_indices_buffer
 
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=quant_config
@@ -152,6 +153,15 @@ class DeepSeekMultiTokenPredictor(nn.Module):
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
+
+        # Expose the v32 indexer top-k buffer at the model level so the
+        # proposer's index_share_for_mtp_iteration row gather (which guards on
+        # hasattr(model, "topk_indices_buffer")) can reach it. Multi-layer
+        # drafts have one buffer per layer, so nothing is exposed there (the
+        # HiSparse gate separately rejects them).
+        first_layer = self.layers[str(self.mtp_start_layer_idx)]
+        if first_layer.topk_indices_buffer is not None and self.num_mtp_layers == 1:
+            self.topk_indices_buffer = first_layer.topk_indices_buffer
 
     def set_skip_topk(self, skip: bool):
         """Toggle skip_topk on all MTP layers with sparse attention.
