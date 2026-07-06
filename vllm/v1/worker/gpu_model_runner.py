@@ -1176,19 +1176,21 @@ class GPUModelRunner(
 
         reset_rows(self.compilation_config.static_forward_context, row_ids)
 
-    def _hisparse_set_num_real_reqs(self, num_reqs: int) -> None:
-        """Publish the real (unpadded) request count for the swap-in kernel.
+    def _hisparse_set_num_real_rows(self, num_rows: int) -> None:
+        """Publish the real (unpadded) token-row count for the HiSparse kernels.
 
-        The HiSparse swap-in kernel skips CUDA-graph padding rows by reading
-        this count from device memory, so it must be set before every (real or
-        dummy) forward — graph replays observe the per-step value.
+        The kernels skip CUDA-graph padding rows by reading this count from
+        device memory, so it must be set before every (real or dummy) forward
+        — graph replays observe the per-step value. Rows are query tokens
+        (== requests for plain decode; requests x query_len on an MTP verify
+        step, where padding is whole requests so real rows form a prefix).
         """
         if self.vllm_config.attention_config.hisparse_config is None:
             return
 
-        from vllm.v1.attention.backends.mla.hisparse import set_num_real_reqs
+        from vllm.v1.attention.backends.mla.hisparse import set_num_real_rows
 
-        set_num_real_reqs(num_reqs)
+        set_num_real_rows(num_rows)
 
     def _hisparse_check_host_memory(
         self, kv_cache_config, host_resident_layers: set[str]
@@ -4443,9 +4445,11 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
-        # Publish the real request count so the HiSparse swap-in kernel skips
+        # Publish the real token-row count so the HiSparse kernels skip
         # CUDA-graph padding rows (no-op unless HiSparse is enabled).
-        self._hisparse_set_num_real_reqs(num_reqs)
+        self._hisparse_set_num_real_rows(
+            scheduler_output.total_num_scheduled_tokens
+        )
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -6084,9 +6088,9 @@ class GPUModelRunner(
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
 
-            # Match the real forward: only the dummy run's real rows are valid
-            # for the HiSparse swap-in kernel (the rest are graph padding).
-            self._hisparse_set_num_real_reqs(num_reqs)
+            # Match the real forward: only the dummy run's real token rows
+            # are valid for the HiSparse kernels (the rest are graph padding).
+            self._hisparse_set_num_real_rows(num_tokens_unpadded)
 
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),

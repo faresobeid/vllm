@@ -654,7 +654,10 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 _HISPARSE_CURRENT_LEADER = self.hisparse_coordinator
             elif _HISPARSE_CURRENT_LEADER is not None:
                 self.hisparse_coordinator.join_group(_HISPARSE_CURRENT_LEADER)
-        self._hisparse_decode_batch = False
+        # Query tokens per request of the current batch when it routes to the
+        # reserved-slot decode path, else 0 (1 for plain decode, 1 + k on an
+        # MTP verify step). The cap comes from the coordinator's config.
+        self._hisparse_decode_qlen = 0
         self._hisparse_dummy_batch = False
         # Prefill BF16 kernel requires 64 on Hopper, 128 on Blackwell
         self.prefill_padding = (
@@ -698,15 +701,18 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         # mapping; do_kv_cache_update must no-op for them.
         self._hisparse_dummy_batch = attn_metadata is None
         if attn_metadata is None:
-            self._hisparse_decode_batch = False
+            self._hisparse_decode_qlen = 0
             return
-        self._hisparse_decode_batch = (
-            self.hisparse_coordinator is not None
-            and is_hisparse_decode_batch(
+        is_decode = self.hisparse_coordinator is not None and (
+            is_hisparse_decode_batch(
                 max_query_len=attn_metadata.max_query_len,
                 num_reqs=attn_metadata.num_reqs,
                 num_actual_tokens=attn_metadata.num_actual_tokens,
+                max_decode_qlen=self.hisparse_coordinator.config.max_qlen,
             )
+        )
+        self._hisparse_decode_qlen = (
+            attn_metadata.max_query_len if is_decode else 0
         )
 
     def _hisparse_swap_in(
@@ -715,11 +721,29 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         topk_indices: torch.Tensor,
         attn_metadata: FlashMLASparseMetadata,
         num_decode_tokens: int | None = None,
+        num_decodes: int | None = None,
         return_valid_counts: bool = False,
     ):
         assert self.hisparse_coordinator is not None
         pure_decode = num_decode_tokens is None
         n = topk_indices.shape[0] if pure_decode else num_decode_tokens
+        if pure_decode:
+            assert self._hisparse_decode_qlen > 0
+            tokens_per_req = self._hisparse_decode_qlen
+            invalidate_window = None
+        else:
+            # Mixed batch: the decode segment is uniform by construction
+            # (split_decodes_and_prefills with require_uniform).
+            assert num_decodes is not None and n % num_decodes == 0
+            tokens_per_req = n // num_decodes
+            # With slot_mapping=None the window resolves as LRU misses from
+            # the host pool; under MTP a rejected token's slot is rewritten
+            # next step, so those hot copies must not survive this step.
+            invalidate_window = (
+                attn_metadata.slot_mapping[:n]
+                if self.hisparse_coordinator.config.max_qlen > 1
+                else None
+            )
         # Index-sharing "shared" layer: replay the leader's plan (produced by
         # its swap_in earlier this pass) instead of re-resolving the LRU.
         if self.hisparse_coordinator.leader is not None:
@@ -729,7 +753,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 num_tokens=n,
                 return_valid_counts=return_valid_counts,
             )
-        return self.hisparse_coordinator.swap_in(
+        result = self.hisparse_coordinator.swap_in(
             kv_cache=kv_c_and_k_pe_cache,
             req_id_per_token=attn_metadata.req_id_per_token[:n],
             block_table=attn_metadata.block_table,
@@ -738,7 +762,13 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             slot_mapping=attn_metadata.slot_mapping if pure_decode else None,
             return_valid_counts=return_valid_counts,
             produce_plan=bool(self.hisparse_coordinator.group_shared),
+            tokens_per_req=tokens_per_req,
         )
+        if invalidate_window is not None:
+            # Mixed batches never run under graph capture, so the eager isin
+            # inside invalidate_slots is safe here.
+            self.hisparse_coordinator.invalidate_slots(invalidate_window)
+        return result
 
     def _hisparse_host_prefill_cache(
         self,
@@ -822,7 +852,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             # Dummy run: nothing to write (slot mapping is all -1).
             return
 
-        if not self._hisparse_decode_batch:
+        if self._hisparse_decode_qlen == 0:
             # Local prefill on this instance (router shortcut for short
             # suffixes, preemption resume, recompute after a failed KV
             # load): write the rows straight to the host pool. Slower than
@@ -844,6 +874,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             slot_mapping,
             kv_cache_dtype,
             k_scale,
+            tokens_per_req=self._hisparse_decode_qlen,
         )
 
     def _forward_bf16_kv(
@@ -856,7 +887,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         # Set by prepare_hisparse_for_batch on the same metadata this step
         # (q is already sliced to num_actual_tokens; dummy runs never reach
         # the forward paths).
-        if self._hisparse_decode_batch:
+        if self._hisparse_decode_qlen > 0:
             kv_c_and_k_pe_cache, topk_indices, topk_length = self._hisparse_swap_in(
                 kv_c_and_k_pe_cache,
                 topk_indices,
@@ -921,6 +952,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 num_decode_tokens=(
                     None if num_prefill_tokens == 0 else num_decode_tokens
                 ),
+                num_decodes=num_decodes,
             )
 
         prefill_request_ids = None
@@ -1044,7 +1076,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         Used when use_mixed_batch is True.
         """
         # Set by prepare_hisparse_for_batch on the same metadata this step.
-        if self._hisparse_decode_batch:
+        if self._hisparse_decode_qlen > 0:
             kv_c_and_k_pe_cache, topk_indices = self._hisparse_swap_in(
                 kv_c_and_k_pe_cache,
                 topk_indices,

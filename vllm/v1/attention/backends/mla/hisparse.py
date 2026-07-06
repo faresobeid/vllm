@@ -14,12 +14,13 @@ concurrency.
   reserved hot slot and are scattered back to the host pool by a CUDA kernel
   writing straight into pinned memory, so the backup is stream-ordered with
   the decode kernels and needs no host synchronization.
-- Each batch row owns a fixed per-layer hot region of
-  ``region_stride = round_up(device_buffer_size + 1, 128)`` KV rows (padded to
-  128 so the flat buffer can be viewed with any kernel page size up to 128).
-  Slots ``[0, device_buffer_size)`` are LRU-managed; slot ``device_buffer_size``
-  is reserved for the newest token, which the KV-cache update writes there
-  directly.
+- Each request owns a fixed per-layer hot region of
+  ``region_stride = round_up(device_buffer_size + max_qlen, 128)`` KV rows
+  (padded to 128 so the flat buffer can be viewed with any kernel page size up
+  to 128), where ``max_qlen`` is 1 + num_speculative_tokens. Slots
+  ``[0, device_buffer_size)`` are LRU-managed; the ``max_qlen`` slots past
+  them are reserved for the step's fresh tokens, which the KV-cache update
+  writes there directly.
 - At decode time, the indexer's top-k positions are converted to global slot
   ids and a swap-in kernel resolves them against the hot region: hits are
   reused, misses are copied from the pinned host pool, and the LRU order is
@@ -58,14 +59,28 @@ def is_hisparse_decode_batch(
     max_query_len: int,
     num_reqs: int,
     num_actual_tokens: int,
+    max_decode_qlen: int = 1,
 ) -> bool:
-    return max_query_len == 1 and num_reqs == num_actual_tokens
+    """Uniform decode batch servable from the reserved hot slots.
+
+    ``max_decode_qlen`` is 1 + num_speculative_tokens: an MTP verify step has
+    that many query tokens per request. The cap matters — a coincidentally
+    uniform prefill batch with a longer query length must not route here
+    (only ``max_decode_qlen`` reserved slots exist per request region).
+    """
+    return (
+        1 <= max_query_len <= max_decode_qlen
+        and num_reqs * max_query_len == num_actual_tokens
+    )
 
 @dataclass(frozen=True)
 class HiSparseConfig:
     top_k: int
     device_buffer_size: int
     host_pool_gib: float
+    # 1 + num_speculative_tokens: query tokens per request in a decode step
+    # (reserved hot slots per region, worst-case token rows per request).
+    max_qlen: int = 1
 
     @classmethod
     def from_vllm_config(
@@ -85,11 +100,18 @@ class HiSparseConfig:
                 f"Known keys: {sorted(known_keys)}."
             )
 
-        # Default 2x top_k: at exactly top_k the LRU has zero slack and
-        # boundary entries thrash between steps.
-        device_buffer_size = int(
-            raw_config.get("device_buffer_size", 2 * model_top_k)
+        spec_config = vllm_config.speculative_config
+        max_qlen = 1 + (
+            spec_config.num_speculative_tokens if spec_config is not None else 0
         )
+
+        # An MTP verify step resolves max_qlen token rows per request against
+        # one LRU state; the buffer must fit their worst-case union or a later
+        # row could evict a slot an earlier row already resolved to. The 2x
+        # default keeps LRU slack (at the exact floor boundary entries thrash
+        # between steps).
+        floor = max_qlen * model_top_k
+        device_buffer_size = int(raw_config.get("device_buffer_size", 2 * floor))
         if raw_config.get("host_pool_gib") is None:
             raise ValueError(
                 "HiSparse requires hisparse_config.host_pool_gib: size it as "
@@ -97,11 +119,19 @@ class HiSparseConfig:
             )
         host_pool_gib = float(raw_config["host_pool_gib"])
 
-        if device_buffer_size < model_top_k:
+        if device_buffer_size < floor:
             raise ValueError(
-                "HiSparse device_buffer_size must be at least the model's "
-                f"index_topk. Got device_buffer_size={device_buffer_size}, "
-                f"index_topk={model_top_k}."
+                "HiSparse device_buffer_size must be at least "
+                "(1 + num_speculative_tokens) * index_topk. Got "
+                f"device_buffer_size={device_buffer_size}, index_topk="
+                f"{model_top_k}, max_qlen={max_qlen} (floor {floor})."
+            )
+        if device_buffer_size >= 32767:
+            raise ValueError(
+                "HiSparse device_buffer_size must fit int16 LRU slots "
+                f"(< 32767). Got {device_buffer_size} (max_qlen={max_qlen}); "
+                "lower num_speculative_tokens or set device_buffer_size "
+                "explicitly."
             )
         if host_pool_gib <= 0:
             raise ValueError("HiSparse host_pool_gib must be positive.")
@@ -110,24 +140,27 @@ class HiSparseConfig:
             top_k=model_top_k,
             device_buffer_size=device_buffer_size,
             host_pool_gib=host_pool_gib,
+            max_qlen=max_qlen,
         )
 
 
 # One per device, shared by all per-layer coordinators: number of real
-# (non-CUDA-graph-padding) requests in the current batch. Updated by the
-# model runner outside captured regions; read by the swap-in kernel from
-# device memory so graph replays observe the per-step value.
-_NUM_REAL_REQS: dict[torch.device, torch.Tensor] = {}
+# (non-CUDA-graph-padding) TOKEN rows in the current batch (== requests when
+# max_qlen is 1; requests x query_len on an MTP verify step — graph padding
+# is whole requests, so real rows are always a prefix). Updated by the model
+# runner outside captured regions; read by the kernels from device memory so
+# graph replays observe the per-step value.
+_NUM_REAL_ROWS: dict[torch.device, torch.Tensor] = {}
 
-def get_num_real_reqs_tensor(device: torch.device) -> torch.Tensor:
-    tensor = _NUM_REAL_REQS.get(device)
+def get_num_real_rows_tensor(device: torch.device) -> torch.Tensor:
+    tensor = _NUM_REAL_ROWS.get(device)
     if tensor is None:
         # Default to "all rows are real" so standalone use (tests, eager
         # deployments without the runner hook) processes every row; the model
         # runner overwrites this each step when driving CUDA graphs.
         tensor = torch.full((1,), torch.iinfo(torch.int32).max, dtype=torch.int32,
                             device=device)
-        _NUM_REAL_REQS[device] = tensor
+        _NUM_REAL_ROWS[device] = tensor
     return tensor
 
 # Plan-producing coordinators register here for telemetry; index-sharing
@@ -170,10 +203,10 @@ def _maybe_log_hisparse_stats() -> None:
         d_misses,
     )
 
-def set_num_real_reqs(num_reqs: int) -> None:
+def set_num_real_rows(num_rows: int) -> None:
     """Called by the model runner before each (real or dummy) forward."""
-    for tensor in _NUM_REAL_REQS.values():
-        tensor.fill_(num_reqs)
+    for tensor in _NUM_REAL_ROWS.values():
+        tensor.fill_(num_rows)
     _maybe_log_hisparse_stats()
 
 def _leader_coordinators(
@@ -350,10 +383,13 @@ class HiSparseCoordinator:
         self.row_width = row_width
         self.kv_dtype = kv_dtype
         self.device = torch.device(device)
-        # One reserved slot for the newest token; the FlashMLA FP8 sparse
-        # kernel needs a paged layout and the actual block size is only known
-        # at swap-in time, hence the alignment padding.
-        self.region_stride = round_up(config.device_buffer_size + 1, HOT_REGION_ALIGN)
+        # max_qlen reserved slots for the step's fresh tokens (1 + k under
+        # MTP); the FlashMLA FP8 sparse kernel needs a paged layout and the
+        # actual block size is only known at swap-in time, hence the
+        # alignment padding.
+        self.region_stride = round_up(
+            config.device_buffer_size + config.max_qlen, HOT_REGION_ALIGN
+        )
 
         row_bytes = row_width * kv_dtype.itemsize
         if row_bytes % 16 != 0:
@@ -383,13 +419,25 @@ class HiSparseCoordinator:
         self.lru_slots: torch.Tensor | None = lru_init.repeat(
             max_num_reqs, 1
         ).contiguous()
-        self._newest_hot_slots = (
-            torch.arange(max_num_reqs, dtype=torch.int64, device=self.device)
-            * self.region_stride
-            + config.device_buffer_size
-        )
+        # Reserved-slot targets for the KV update, per query length q: token
+        # row (r, j) writes to r*region_stride + dbs + j. Precomputed for
+        # every q up to max_qlen — write_newest_rows runs under graph capture,
+        # so no lazy allocation there.
+        self._newest_hot_slots = {
+            q: (
+                torch.arange(
+                    max_num_reqs, dtype=torch.int64, device=self.device
+                ).repeat_interleave(q)
+                * self.region_stride
+                + config.device_buffer_size
+                + torch.arange(q, dtype=torch.int64, device=self.device).repeat(
+                    max_num_reqs
+                )
+            )
+            for q in range(1, config.max_qlen + 1)
+        }
 
-        self.num_real_reqs = get_num_real_reqs_tensor(self.device)
+        self.num_real_rows = get_num_real_rows_tensor(self.device)
 
         # In-kernel hit/miss counters (telemetry). stats_row_bytes converts
         # misses to gathered bytes; plan-once wiring adds each shared
@@ -399,8 +447,11 @@ class HiSparseCoordinator:
         self.stats_row_bytes = row_bytes
         _STATS.append(self)
 
-        # Group-shared plan buffers for index-sharing plan-once (see _GroupPlan).
-        self._plan = _get_group_plan(self.device, max_num_reqs, config.top_k)
+        # Group-shared plan buffers for index-sharing plan-once (see
+        # _GroupPlan), sized in token rows (requests x max_qlen).
+        self._plan = _get_group_plan(
+            self.device, max_num_reqs * config.max_qlen, config.top_k
+        )
 
         # Overlapped prefetch: a "full" layer issues its group's "shared"
         # gathers early on a copy stream, overlapping the PCIe transfer with
@@ -527,13 +578,14 @@ class HiSparseCoordinator:
         slot_mapping: torch.Tensor,
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
+        tokens_per_req: int = 1,
     ) -> None:
         """Decode-step KV update.
 
-        Writes the newest token of each batch row to its reserved hot slot
-        (so the swap-in kernel can serve the newest token without a host
-        roundtrip), then scatters it into the host pool at its global KV slot
-        (so later steps can miss-load it).
+        Writes each request's fresh tokens (1, or 1 + k on an MTP verify
+        step) to its reserved hot slots (so the swap-in kernel can serve them
+        without a host roundtrip), then scatters them into the host pool at
+        their global KV slots (so later steps can miss-load them).
         """
         from vllm import _custom_ops as ops
 
@@ -541,8 +593,8 @@ class HiSparseCoordinator:
             return
         self.bind_source_cache(kv_cache)
         num_tokens = kv_c_normed.shape[0]
-        assert num_tokens <= self.max_num_reqs
-        newest_slots = self._newest_hot_slots[:num_tokens]
+        assert num_tokens <= self.max_num_reqs * tokens_per_req
+        newest_slots = self._newest_hot_slots[tokens_per_req][:num_tokens]
         global_slots = slot_mapping[:num_tokens].to(torch.int64)
 
         # -1-padded slots (CUDA-graph padding) are skipped by the backup
@@ -634,6 +686,7 @@ class HiSparseCoordinator:
         slot_mapping: torch.Tensor | None,
         return_valid_counts: bool = False,
         produce_plan: bool = False,
+        tokens_per_req: int = 1,
     ) -> (
         tuple[torch.Tensor, torch.Tensor]
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -702,7 +755,7 @@ class HiSparseCoordinator:
             hot_indices = torch.full_like(global_indices, -1)
             miss_mask = None
 
-        # Padded rows are skipped by the kernel (num_real_reqs) and must
+        # Padded rows are skipped by the kernel (num_real_rows) and must
         # come out as -1 so the attention kernel masks them.
         torch.ops._C_cache_ops.hisparse_swap_in(
             self._host_cache,
@@ -712,10 +765,11 @@ class HiSparseCoordinator:
             hot_indices,
             self.device_global_indices,
             self.lru_slots,
-            self.num_real_reqs,
+            self.num_real_rows,
             self.region_stride,
             miss_mask,
             self._swap_stats,
+            tokens_per_req,
         )
 
         if produce_plan:
@@ -748,7 +802,7 @@ class HiSparseCoordinator:
             self._plan.global_indices[:num_tokens],
             self._plan.hot_indices[:num_tokens],
             self._plan.miss_mask[:num_tokens],
-            self.num_real_reqs,
+            self.num_real_rows,
         )
 
     def _prefetch_group(self, num_tokens: int) -> None:

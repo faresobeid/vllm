@@ -92,7 +92,17 @@ __device__ __forceinline__ int warp_inclusive_scan(int32_t* s_data,
   return __shfl_sync(0xffffffff, val, 31);
 }
 
-// One block per batch row.
+// One block per REQUEST. Each request contributes `tokens_per_req`
+// consecutive token rows in global_indices/hot_indices (tokens_per_req = 1
+// for plain decode, 1 + num_speculative_tokens for an MTP verify step); all
+// of them resolve against the request's single LRU state, sequentially, so
+// token t+1 sees token t's misses as hits and no two rows ever mutate the
+// LRU concurrently. Fresh tokens of the current step live in the reserved
+// slots [hot_size, hot_size + tokens_per_req) of the request's region and
+// are matched against the whole window (a verify token may reference any
+// earlier token of the same step as context); they never enter
+// device_global_indices, which is what keeps rewritten (rejected) slots
+// from ever being served stale.
 //
 // Shared memory layout (int32 region followed by int16 region):
 //   s_topk[top_k]            top-k global ids; reused as miss scratch
@@ -100,31 +110,33 @@ __device__ __forceinline__ int warp_inclusive_scan(int32_t* s_data,
 //   s_evict_off[nbc + 1]     prefix sums for evictable compaction
 //   s_hash_keys[hash_size]   open addressing: global id -> top-k index
 //   s_counters[2]            [0] buffer hits, [1] resolved-in-phase-1 count
+//   s_newest[tokens_per_req] the request's reserved-slot window ids
 //   s_lru_out[hot_size]      int16, compacted slots: [hits fwd | evict bwd]
 //   s_hash_vals[hash_size]   int16 hash values (top-k index)
 __global__ void hisparse_swap_in_kernel(
     const char* __restrict__ host_cache,          // [host_rows, row_bytes]
-    char* __restrict__ hot_cache,                 // [n_rows*stride, row_bytes]
-    const int32_t* __restrict__ global_indices,   // [num_rows, top_k]
-    const int32_t* __restrict__ newest_global,    // [num_rows] or nullptr
-    int32_t* __restrict__ hot_indices,            // [num_rows, top_k]
-    int32_t* __restrict__ miss_mask,              // [num_rows, top_k] or nullptr
-    int32_t* __restrict__ device_global_indices,  // [max_rows, hot_size]
-    int16_t* __restrict__ lru_slots,              // [max_rows, hot_size]
+    char* __restrict__ hot_cache,                 // [n_reqs*stride, row_bytes]
+    const int32_t* __restrict__ global_indices,   // [num_reqs*tpr, top_k]
+    const int32_t* __restrict__ newest_global,    // [num_reqs*tpr] or nullptr
+    int32_t* __restrict__ hot_indices,            // [num_reqs*tpr, top_k]
+    int32_t* __restrict__ miss_mask,              // [num_reqs*tpr, top_k] or null
+    int32_t* __restrict__ device_global_indices,  // [max_reqs, hot_size]
+    int16_t* __restrict__ lru_slots,              // [max_reqs, hot_size]
     unsigned long long* __restrict__ stats,       // [2] hits,misses or nullptr
-    const int32_t* __restrict__ num_real_reqs,    // [1] or nullptr
+    const int32_t* __restrict__ num_real_rows,    // [1] real TOKEN rows or null
     const int64_t host_rows, const int64_t row_bytes, const int32_t top_k,
     const int32_t hot_size, const int32_t hash_size,
-    const int64_t region_stride) {
+    const int64_t region_stride, const int32_t tokens_per_req) {
   const int NUM_WARPS = blockDim.x / kWarpSize;
   const int num_buffer_chunks = (hot_size + kWarpSize - 1) / kWarpSize;
   const int num_token_chunks = (top_k + kWarpSize - 1) / kWarpSize;
 
-  const int row = blockIdx.x;
-  // CUDA-graph padding: rows past the real batch carry stale top-k/state and
-  // must not be processed. Read from device memory so graph replays see the
-  // per-step value.
-  if (num_real_reqs != nullptr && row >= num_real_reqs[0]) {
+  const int req = blockIdx.x;
+  // CUDA-graph padding is whole requests: rows past the real batch carry
+  // stale top-k/state and must not be processed. Read from device memory so
+  // graph replays see the per-step value.
+  if (num_real_rows != nullptr &&
+      static_cast<int64_t>(req) * tokens_per_req >= num_real_rows[0]) {
     return;
   }
   const int tid = threadIdx.x;
@@ -132,18 +144,10 @@ __global__ void hisparse_swap_in_kernel(
   const int lane_id = tid % kWarpSize;
   const unsigned int lanes_before = ((unsigned int)1 << lane_id) - 1;
 
-  const int64_t hot_base = static_cast<int64_t>(row) * region_stride;
-  const int32_t newest_id =
-      (newest_global != nullptr) ? newest_global[row] : -1;
-
-  const int32_t* row_topk = global_indices + static_cast<int64_t>(row) * top_k;
-  int32_t* row_out = hot_indices + static_cast<int64_t>(row) * top_k;
-  int32_t* row_miss =
-      (miss_mask != nullptr) ? miss_mask + static_cast<int64_t>(row) * top_k
-                             : nullptr;
+  const int64_t hot_base = static_cast<int64_t>(req) * region_stride;
   int32_t* row_dgi =
-      device_global_indices + static_cast<int64_t>(row) * hot_size;
-  int16_t* row_lru = lru_slots + static_cast<int64_t>(row) * hot_size;
+      device_global_indices + static_cast<int64_t>(req) * hot_size;
+  int16_t* row_lru = lru_slots + static_cast<int64_t>(req) * hot_size;
 
   extern __shared__ char smem_raw[];
   int32_t* s_topk = reinterpret_cast<int32_t*>(smem_raw);
@@ -151,222 +155,263 @@ __global__ void hisparse_swap_in_kernel(
   int32_t* s_evict_off = s_chunk_off + (num_buffer_chunks + 1);
   int32_t* s_hash_keys = s_evict_off + (num_buffer_chunks + 1);
   int32_t* s_counters = s_hash_keys + hash_size;
-  int16_t* s_lru_out = reinterpret_cast<int16_t*>(s_counters + 2);
+  int32_t* s_newest = s_counters + 2;
+  int16_t* s_lru_out = reinterpret_cast<int16_t*>(s_newest + tokens_per_req);
   int16_t* s_hash_vals = s_lru_out + hot_size;
 
-  if (tid < 2) {
-    s_counters[tid] = 0;
+  // The request's reserved-slot window: token row j's fresh KV sits in
+  // reserved slot hot_size + j (written there by the KV-cache update, keyed
+  // by the same slot_mapping order).
+  for (int j = tid; j < tokens_per_req; j += blockDim.x) {
+    s_newest[j] =
+        (newest_global != nullptr)
+            ? newest_global[static_cast<int64_t>(req) * tokens_per_req + j]
+            : -1;
   }
-  for (int i = tid; i < hash_size; i += blockDim.x) {
-    s_hash_keys[i] = kHashEmpty;
-  }
-  for (int i = tid; i < num_buffer_chunks + 1; i += blockDim.x) {
-    s_chunk_off[i] = 0;
-    s_evict_off[i] = 0;
-  }
-  __syncthreads();
 
-  // Phase 1: resolve invalid / newest entries, hash the rest.
-  for (int i = tid; i < top_k; i += blockDim.x) {
-    const int32_t g = row_topk[i];
-    if (row_miss != nullptr) row_miss[i] = 0;
-    if (g < 0) {
-      row_out[i] = -1;
-      s_topk[i] = kTokenDone;
-      atomicAdd(&s_counters[1], 1);
-    } else if (g == newest_id) {
-      // Newest token lives in the reserved slot past the LRU range.
-      row_out[i] = static_cast<int32_t>(hot_base) + hot_size;
-      s_topk[i] = kTokenDone;
-      atomicAdd(&s_counters[1], 1);
-    } else {
-      int slot = hash_slot(g, hash_size);
-      while (true) {
-        const int32_t old = atomicCAS(&s_hash_keys[slot], kHashEmpty, g);
-        if (old == kHashEmpty || old == g) {
-          s_hash_vals[slot] = static_cast<int16_t>(i);
+  for (int t = 0; t < tokens_per_req; ++t) {
+    const int64_t tok = static_cast<int64_t>(req) * tokens_per_req + t;
+    const int32_t* row_topk = global_indices + tok * top_k;
+    int32_t* row_out = hot_indices + tok * top_k;
+    int32_t* row_miss =
+        (miss_mask != nullptr) ? miss_mask + tok * top_k : nullptr;
+
+    if (tid < 2) {
+      s_counters[tid] = 0;
+    }
+    for (int i = tid; i < hash_size; i += blockDim.x) {
+      s_hash_keys[i] = kHashEmpty;
+    }
+    for (int i = tid; i < num_buffer_chunks + 1; i += blockDim.x) {
+      s_chunk_off[i] = 0;
+      s_evict_off[i] = 0;
+    }
+    // Also orders iteration t-1's phase-3 dgi claims and phase-5 ownership
+    // withdrawals before this iteration's phase 2, and protects the
+    // s_topk/s_lru_out scratch reuse across iterations.
+    __syncthreads();
+
+    // Phase 1: resolve invalid / newest-window entries, hash the rest.
+    for (int i = tid; i < top_k; i += blockDim.x) {
+      const int32_t g = row_topk[i];
+      if (row_miss != nullptr) row_miss[i] = 0;
+      if (g < 0) {
+        row_out[i] = -1;
+        s_topk[i] = kTokenDone;
+        atomicAdd(&s_counters[1], 1);
+        continue;
+      }
+      int window_j = -1;
+      for (int j = 0; j < tokens_per_req; ++j) {
+        if (g == s_newest[j]) {
+          window_j = j;
           break;
         }
-        slot = (slot + 1) % hash_size;
       }
-      s_topk[i] = g;
-    }
-  }
-  __syncthreads();
-
-  // Phase 2: walk hot slots in LRU order, classify hit / evictable, and
-  // compact them (hits forward, evictables backward) into s_lru_out.
-  const int iters_buffer = (num_buffer_chunks + NUM_WARPS - 1) / NUM_WARPS;
-  int total_hit_count = 0;
-  int total_evict_count = 0;
-  for (int iter = 0; iter < iters_buffer; iter++) {
-    const int chunk_idx = warp_id + iter * NUM_WARPS;
-    const bool has_valid_chunk = chunk_idx < num_buffer_chunks;
-
-    const int pos = chunk_idx * kWarpSize + lane_id;
-    const bool has_valid_pos = has_valid_chunk && (pos < hot_size);
-    const int16_t slot = has_valid_pos ? row_lru[pos] : int16_t(-1);
-    const int32_t cached_g = (slot >= 0) ? row_dgi[slot] : -1;
-
-    int found_topk_idx = -1;
-    if (cached_g >= 0) {
-      int h = hash_slot(cached_g, hash_size);
-      while (true) {
-        const int32_t k = s_hash_keys[h];
-        if (k == cached_g) {
-          found_topk_idx = static_cast<int32_t>(s_hash_vals[h]);
-          break;
+      if (window_j >= 0) {
+        // This step's fresh tokens live in the reserved slots past the LRU
+        // range; matching the whole window (not just row t's own slot) is
+        // what keeps speculative positions out of device_global_indices.
+        row_out[i] = static_cast<int32_t>(hot_base) + hot_size + window_j;
+        s_topk[i] = kTokenDone;
+        atomicAdd(&s_counters[1], 1);
+      } else {
+        int slot = hash_slot(g, hash_size);
+        while (true) {
+          const int32_t old = atomicCAS(&s_hash_keys[slot], kHashEmpty, g);
+          if (old == kHashEmpty || old == g) {
+            s_hash_vals[slot] = static_cast<int16_t>(i);
+            break;
+          }
+          slot = (slot + 1) % hash_size;
         }
-        if (k == kHashEmpty) break;
-        h = (h + 1) % hash_size;
-      }
-    }
-    const bool is_hit = found_topk_idx >= 0;
-    const bool is_evictable = has_valid_pos && !is_hit;
-
-    if (is_hit) {
-      s_topk[found_topk_idx] = kTokenDone;
-      row_out[found_topk_idx] = static_cast<int32_t>(hot_base) + slot;
-    }
-
-    int local_hit_off = 0;
-    int local_evict_off = 0;
-    if (has_valid_chunk) {
-      const unsigned int hit_mask = __ballot_sync(0xFFFFFFFF, is_hit);
-      const unsigned int evict_mask = __ballot_sync(0xFFFFFFFF, is_evictable);
-      local_hit_off = __popc(hit_mask & lanes_before);
-      local_evict_off = __popc(evict_mask & lanes_before);
-      if (lane_id == 0) {
-        s_chunk_off[chunk_idx + 1] = __popc(hit_mask);
-        s_evict_off[chunk_idx + 1] = __popc(evict_mask);
+        s_topk[i] = g;
       }
     }
     __syncthreads();
 
-    if (warp_id == 0) {
-      total_hit_count =
-          warp_inclusive_scan(s_chunk_off, lane_id, chunk_idx + 1,
-                              num_buffer_chunks + 1, total_hit_count);
-      total_evict_count =
-          warp_inclusive_scan(s_evict_off, lane_id, chunk_idx + 1,
-                              num_buffer_chunks + 1, total_evict_count);
-      if (tid == 0) {
-        s_counters[0] = total_hit_count;
+    // Phase 2: walk hot slots in LRU order, classify hit / evictable, and
+    // compact them (hits forward, evictables backward) into s_lru_out.
+    const int iters_buffer = (num_buffer_chunks + NUM_WARPS - 1) / NUM_WARPS;
+    int total_hit_count = 0;
+    int total_evict_count = 0;
+    for (int iter = 0; iter < iters_buffer; iter++) {
+      const int chunk_idx = warp_id + iter * NUM_WARPS;
+      const bool has_valid_chunk = chunk_idx < num_buffer_chunks;
+
+      const int pos = chunk_idx * kWarpSize + lane_id;
+      const bool has_valid_pos = has_valid_chunk && (pos < hot_size);
+      const int16_t slot = has_valid_pos ? row_lru[pos] : int16_t(-1);
+      const int32_t cached_g = (slot >= 0) ? row_dgi[slot] : -1;
+
+      int found_topk_idx = -1;
+      if (cached_g >= 0) {
+        int h = hash_slot(cached_g, hash_size);
+        while (true) {
+          const int32_t k = s_hash_keys[h];
+          if (k == cached_g) {
+            found_topk_idx = static_cast<int32_t>(s_hash_vals[h]);
+            break;
+          }
+          if (k == kHashEmpty) break;
+          h = (h + 1) % hash_size;
+        }
+      }
+      const bool is_hit = found_topk_idx >= 0;
+      const bool is_evictable = has_valid_pos && !is_hit;
+
+      if (is_hit) {
+        s_topk[found_topk_idx] = kTokenDone;
+        row_out[found_topk_idx] = static_cast<int32_t>(hot_base) + slot;
+      }
+
+      int local_hit_off = 0;
+      int local_evict_off = 0;
+      if (has_valid_chunk) {
+        const unsigned int hit_mask = __ballot_sync(0xFFFFFFFF, is_hit);
+        const unsigned int evict_mask = __ballot_sync(0xFFFFFFFF, is_evictable);
+        local_hit_off = __popc(hit_mask & lanes_before);
+        local_evict_off = __popc(evict_mask & lanes_before);
+        if (lane_id == 0) {
+          s_chunk_off[chunk_idx + 1] = __popc(hit_mask);
+          s_evict_off[chunk_idx + 1] = __popc(evict_mask);
+        }
+      }
+      __syncthreads();
+
+      if (warp_id == 0) {
+        total_hit_count =
+            warp_inclusive_scan(s_chunk_off, lane_id, chunk_idx + 1,
+                                num_buffer_chunks + 1, total_hit_count);
+        total_evict_count =
+            warp_inclusive_scan(s_evict_off, lane_id, chunk_idx + 1,
+                                num_buffer_chunks + 1, total_evict_count);
+        if (tid == 0) {
+          s_counters[0] = total_hit_count;
+        }
+      }
+      __syncthreads();
+
+      if (is_hit) {
+        const int off = s_chunk_off[chunk_idx] + local_hit_off;
+        s_lru_out[off] = slot;
+      }
+      if (is_evictable) {
+        const int off = s_evict_off[chunk_idx] + local_evict_off;
+        s_lru_out[hot_size - 1 - off] = slot;
       }
     }
     __syncthreads();
 
-    if (is_hit) {
-      const int off = s_chunk_off[chunk_idx] + local_hit_off;
-      s_lru_out[off] = slot;
+    // Reset prefix sums for the miss compaction (token chunks <= buffer
+    // chunks because hot_size >= top_k).
+    for (int i = tid; i < num_token_chunks + 1; i += blockDim.x) {
+      s_chunk_off[i] = 0;
     }
-    if (is_evictable) {
-      const int off = s_evict_off[chunk_idx] + local_evict_off;
-      s_lru_out[hot_size - 1 - off] = slot;
-    }
-  }
-  __syncthreads();
+    __syncthreads();
 
-  // Reset prefix sums for the miss compaction (token chunks <= buffer
-  // chunks because hot_size >= top_k).
-  for (int i = tid; i < num_token_chunks + 1; i += blockDim.x) {
-    s_chunk_off[i] = 0;
-  }
-  __syncthreads();
+    // Phase 3: compact misses, assign them eviction slots (oldest first) and
+    // record the new ownership in device_global_indices.
+    const int iters_token = (num_token_chunks + NUM_WARPS - 1) / NUM_WARPS;
+    int miss_running_total = 0;
+    for (int iter = 0; iter < iters_token; iter++) {
+      const int chunk_idx = warp_id + iter * NUM_WARPS;
+      const bool has_valid_chunk = chunk_idx < num_token_chunks;
 
-  // Phase 3: compact misses, assign them eviction slots (oldest first) and
-  // record the new ownership in device_global_indices.
-  const int iters_token = (num_token_chunks + NUM_WARPS - 1) / NUM_WARPS;
-  int miss_running_total = 0;
-  for (int iter = 0; iter < iters_token; iter++) {
-    const int chunk_idx = warp_id + iter * NUM_WARPS;
-    const bool has_valid_chunk = chunk_idx < num_token_chunks;
+      const int i = chunk_idx * kWarpSize + lane_id;
+      const bool has_valid_token = has_valid_chunk && (i < top_k);
 
-    const int i = chunk_idx * kWarpSize + lane_id;
-    const bool has_valid_token = has_valid_chunk && (i < top_k);
+      int32_t g = 0;
+      bool is_miss = false;
+      if (has_valid_token) {
+        is_miss = s_topk[i] != kTokenDone;
+        if (is_miss) {
+          g = s_topk[i];
+        }
+      }
 
-    int32_t g = 0;
-    bool is_miss = false;
-    if (has_valid_token) {
-      is_miss = s_topk[i] != kTokenDone;
+      int local_miss_off = 0;
+      if (has_valid_chunk) {
+        const unsigned int miss_mask_b = __ballot_sync(0xFFFFFFFF, is_miss);
+        local_miss_off = __popc(miss_mask_b & lanes_before);
+        if (lane_id == 0) {
+          s_chunk_off[chunk_idx + 1] = __popc(miss_mask_b);
+        }
+      }
+      __syncthreads();
+
+      if (warp_id == 0) {
+        miss_running_total =
+            warp_inclusive_scan(s_chunk_off, lane_id, chunk_idx + 1,
+                                num_token_chunks + 1, miss_running_total);
+      }
+      __syncthreads();
+
       if (is_miss) {
-        g = s_topk[i];
-      }
-    }
-
-    int local_miss_off = 0;
-    if (has_valid_chunk) {
-      const unsigned int miss_mask = __ballot_sync(0xFFFFFFFF, is_miss);
-      local_miss_off = __popc(miss_mask & lanes_before);
-      if (lane_id == 0) {
-        s_chunk_off[chunk_idx + 1] = __popc(miss_mask);
+        const int m = s_chunk_off[chunk_idx] + local_miss_off;
+        const int16_t evict_slot = s_lru_out[hot_size - 1 - m];
+        // Reuse s_topk as compacted miss scratch: m < i always holds (done
+        // entries are skipped), so writes never overrun pending reads.
+        s_topk[m] = g;
+        row_out[i] = static_cast<int32_t>(hot_base) + evict_slot;
+        if (row_miss != nullptr) row_miss[i] = 1;
+        row_dgi[evict_slot] = g;
       }
     }
     __syncthreads();
 
-    if (warp_id == 0) {
-      miss_running_total =
-          warp_inclusive_scan(s_chunk_off, lane_id, chunk_idx + 1,
-                              num_token_chunks + 1, miss_running_total);
-    }
-    __syncthreads();
+    const int total_hits = s_counters[0];
+    const int total_misses = top_k - total_hits - s_counters[1];
 
-    if (is_miss) {
-      const int m = s_chunk_off[chunk_idx] + local_miss_off;
+    // Aggregate hit/miss counters (hit rate + PCIe gather volume telemetry),
+    // per token row so gathered-bytes stays exact.
+    if (stats != nullptr && threadIdx.x == 0) {
+      atomicAdd(&stats[0], static_cast<unsigned long long>(total_hits));
+      atomicAdd(&stats[1], static_cast<unsigned long long>(total_misses));
+    }
+
+    // Phase 4: write back the LRU order: stale evictables at the front,
+    // freshly loaded misses next, hits at the MRU back. Slots claimed by
+    // earlier token rows of this call sit at the MRU end, so with
+    // hot_size >= tokens_per_req * top_k later rows always consume
+    // never-claimed evictables first and cannot evict them.
+    const int total_evictable = hot_size - total_hits;
+    for (int i = tid; i < hot_size; i += blockDim.x) {
+      if (i < total_misses) {
+        row_lru[total_evictable - total_misses + i] =
+            s_lru_out[hot_size - 1 - i];
+      } else if (i < total_evictable) {
+        row_lru[i - total_misses] = s_lru_out[hot_size - 1 - i];
+      } else {
+        row_lru[i] = s_lru_out[i - total_evictable];
+      }
+    }
+
+    // Phase 5: copy missed rows from the host pool, one warp per miss.
+    for (int m = warp_id; m < total_misses; m += NUM_WARPS) {
+      const int32_t g = s_topk[m];
       const int16_t evict_slot = s_lru_out[hot_size - 1 - m];
-      // Reuse s_topk as compacted miss scratch: m < i always holds (done
-      // entries are skipped), so writes never overrun pending reads.
-      s_topk[m] = g;
-      row_out[i] = static_cast<int32_t>(hot_base) + evict_slot;
-      if (row_miss != nullptr) row_miss[i] = 1;
-      row_dgi[evict_slot] = g;
-    }
-  }
-  __syncthreads();
+      char* dst = hot_cache + (hot_base + evict_slot) * row_bytes;
 
-  const int total_hits = s_counters[0];
-  const int total_misses = top_k - total_hits - s_counters[1];
-
-  // Aggregate hit/miss counters (hit rate + PCIe gather volume telemetry).
-  if (stats != nullptr && threadIdx.x == 0) {
-    atomicAdd(&stats[0], static_cast<unsigned long long>(total_hits));
-    atomicAdd(&stats[1], static_cast<unsigned long long>(total_misses));
-  }
-
-  // Phase 4: write back the LRU order: stale evictables at the front,
-  // freshly loaded misses next, hits at the MRU back.
-  const int total_evictable = hot_size - total_hits;
-  for (int i = tid; i < hot_size; i += blockDim.x) {
-    if (i < total_misses) {
-      row_lru[total_evictable - total_misses + i] =
-          s_lru_out[hot_size - 1 - i];
-    } else if (i < total_evictable) {
-      row_lru[i - total_misses] = s_lru_out[hot_size - 1 - i];
-    } else {
-      row_lru[i] = s_lru_out[i - total_evictable];
-    }
-  }
-
-  // Phase 5: copy missed rows from the host pool, one warp per miss.
-  for (int m = warp_id; m < total_misses; m += NUM_WARPS) {
-    const int32_t g = s_topk[m];
-    const int16_t evict_slot = s_lru_out[hot_size - 1 - m];
-    char* dst = hot_cache + (hot_base + evict_slot) * row_bytes;
-
-    if (g >= 0 && g < host_rows) {
-      copy_row_warp(lane_id, host_cache + static_cast<int64_t>(g) * row_bytes,
-                    dst, row_bytes);
-    } else {
-      // No source row for g: never serve the evicted slot's stale bytes
-      // as g. Zero the row (deterministic, visible in output quality) and
-      // withdraw the phase-3 ownership claim so later steps re-miss instead
-      // of hitting the unfilled slot.
-      zero_row_warp(lane_id, dst, row_bytes);
-      __syncwarp();
-      if (lane_id == 0) {
-        row_dgi[evict_slot] = -1;
+      if (g >= 0 && g < host_rows) {
+        copy_row_warp(lane_id, host_cache + static_cast<int64_t>(g) * row_bytes,
+                      dst, row_bytes);
+      } else {
+        // No source row for g: never serve the evicted slot's stale bytes
+        // as g. Zero the row (deterministic, visible in output quality) and
+        // withdraw the phase-3 ownership claim so later steps re-miss instead
+        // of hitting the unfilled slot.
+        zero_row_warp(lane_id, dst, row_bytes);
+        __syncwarp();
+        if (lane_id == 0) {
+          row_dgi[evict_slot] = -1;
+        }
       }
     }
+    // A fast thread must not reach iteration t+1's scratch init (which
+    // zeroes s_counters) before every thread has read this iteration's
+    // totals after the phase-3 barrier.
+    __syncthreads();
   }
 }
 
@@ -382,7 +427,7 @@ __global__ void hisparse_gather_plan_kernel(
     const int32_t* __restrict__ global_indices,   // [num_rows, top_k]
     const int32_t* __restrict__ hot_indices,      // [num_rows, top_k] abs hot rows
     const int32_t* __restrict__ miss_mask,        // [num_rows, top_k]
-    const int32_t* __restrict__ num_real_reqs,    // [1] or nullptr
+    const int32_t* __restrict__ num_real_rows,    // [1] real TOKEN rows or null
     const int64_t host_rows, const int64_t hot_rows, const int64_t row_bytes,
     const int32_t top_k) {
   const int NUM_WARPS = blockDim.x / kWarpSize;
@@ -391,7 +436,7 @@ __global__ void hisparse_gather_plan_kernel(
   // batches) still fill the device with outstanding host reads instead of
   // starving on one block per row.
   const int row = blockIdx.x;
-  if (num_real_reqs != nullptr && row >= num_real_reqs[0]) {
+  if (num_real_rows != nullptr && row >= num_real_rows[0]) {
     return;
   }
   const int warp_id = threadIdx.x / kWarpSize;
@@ -462,10 +507,11 @@ void hisparse_swap_in(torch::stable::Tensor const& host_cache,
                       torch::stable::Tensor& hot_indices,
                       torch::stable::Tensor& device_global_indices,
                       torch::stable::Tensor& lru_slots,
-                      std::optional<torch::stable::Tensor> const& num_real_reqs,
+                      std::optional<torch::stable::Tensor> const& num_real_rows,
                       int64_t region_stride,
                       std::optional<torch::stable::Tensor> const& miss_mask,
-                      std::optional<torch::stable::Tensor> const& stats) {
+                      std::optional<torch::stable::Tensor> const& stats,
+                      int64_t tokens_per_req) {
   STD_TORCH_CHECK(host_cache.device().is_cpu(),
               "host_cache must be CPU memory");
   STD_TORCH_CHECK(hot_cache.is_cuda(), "hot_cache must be on CUDA");
@@ -501,13 +547,20 @@ void hisparse_swap_in(torch::stable::Tensor const& host_cache,
   const auto num_rows = static_cast<int32_t>(global_indices.size(0));
   const auto top_k = static_cast<int32_t>(global_indices.size(1));
   const auto hot_size = static_cast<int32_t>(device_global_indices.size(1));
-  STD_TORCH_CHECK(hot_size >= top_k, "hot buffer size must be >= top_k");
+  STD_TORCH_CHECK(tokens_per_req >= 1 && num_rows % tokens_per_req == 0,
+              "num_rows must be a whole number of requests of tokens_per_req "
+              "token rows each");
+  const auto num_reqs = static_cast<int32_t>(num_rows / tokens_per_req);
+  STD_TORCH_CHECK(hot_size >= tokens_per_req * top_k,
+              "hot buffer must fit the worst-case union of a request's "
+              "token rows (tokens_per_req * top_k)");
   STD_TORCH_CHECK(hot_size < 32767, "hot buffer size must fit int16 slots");
-  STD_TORCH_CHECK(region_stride > hot_size,
-              "region_stride must reserve a newest slot past hot_size");
-  STD_TORCH_CHECK(device_global_indices.size(0) >= num_rows,
+  STD_TORCH_CHECK(region_stride >= hot_size + tokens_per_req,
+              "region_stride must reserve tokens_per_req newest slots past "
+              "hot_size");
+  STD_TORCH_CHECK(device_global_indices.size(0) >= num_reqs,
               "device_global_indices has too few rows");
-  STD_TORCH_CHECK(static_cast<int64_t>(num_rows) * region_stride <= hot_rows,
+  STD_TORCH_CHECK(static_cast<int64_t>(num_reqs) * region_stride <= hot_rows,
               "hot_cache has too few rows");
   STD_TORCH_CHECK(hot_rows < INT32_MAX, "hot indices must fit int32");
 
@@ -521,11 +574,11 @@ void hisparse_swap_in(torch::stable::Tensor const& host_cache,
   }
 
   const int32_t* num_real_ptr = nullptr;
-  if (num_real_reqs.has_value()) {
-    auto const& num_real = num_real_reqs.value();
+  if (num_real_rows.has_value()) {
+    auto const& num_real = num_real_rows.value();
     STD_TORCH_CHECK(num_real.is_cuda() && num_real.scalar_type() == torch::headeronly::ScalarType::Int &&
                     num_real.numel() >= 1,
-                "num_real_reqs must be int32 on CUDA");
+                "num_real_rows must be int32 on CUDA");
     num_real_ptr = num_real.const_data_ptr<int32_t>();
   }
 
@@ -560,24 +613,32 @@ void hisparse_swap_in(torch::stable::Tensor const& host_cache,
   const int hash_size = 2 * top_k;
   const int num_buffer_chunks = (hot_size + kWarpSize - 1) / kWarpSize;
   const size_t smem_bytes =
-      sizeof(int32_t) * (top_k + 2 * (num_buffer_chunks + 1) + hash_size + 2) +
+      sizeof(int32_t) *
+          (top_k + 2 * (num_buffer_chunks + 1) + hash_size + 2 +
+           tokens_per_req) +
       sizeof(int16_t) * (hot_size + hash_size);
 
   const torch::stable::accelerator::DeviceGuard device_guard(hot_cache.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
   auto kernel = hisparse_swap_in_kernel;
-  if (smem_bytes > 48 * 1024) {
+  // The attribute is a ceiling: setting it once for the largest smem_bytes
+  // seen covers the alternating draft (tpr=1) / verify (tpr=s) launch sizes.
+  // A plain static is safe with one GPU per worker process.
+  static size_t configured_smem = 0;
+  if (smem_bytes > 48 * 1024 && smem_bytes > configured_smem) {
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          smem_bytes);
+    configured_smem = smem_bytes;
   }
-  kernel<<<num_rows, kBlockSize, smem_bytes, stream>>>(
+  kernel<<<num_reqs, kBlockSize, smem_bytes, stream>>>(
       static_cast<const char*>(host_cache.const_data_ptr()),
       static_cast<char*>(hot_cache_2d.mutable_data_ptr()),
       global_indices.const_data_ptr<int32_t>(), newest_ptr,
       hot_indices.mutable_data_ptr<int32_t>(), miss_mask_ptr,
       device_global_indices.mutable_data_ptr<int32_t>(),
       lru_slots.mutable_data_ptr<int16_t>(), stats_ptr, num_real_ptr, host_rows,
-      row_bytes, top_k, hot_size, hash_size, region_stride);
+      row_bytes, top_k, hot_size, hash_size, region_stride,
+      static_cast<int32_t>(tokens_per_req));
 }
 
 void hisparse_gather_plan(torch::stable::Tensor const& host_cache,
@@ -585,7 +646,7 @@ void hisparse_gather_plan(torch::stable::Tensor const& host_cache,
                           torch::stable::Tensor const& global_indices,
                           torch::stable::Tensor const& hot_indices,
                           torch::stable::Tensor const& miss_mask,
-                          std::optional<torch::stable::Tensor> const& num_real_reqs) {
+                          std::optional<torch::stable::Tensor> const& num_real_rows) {
   STD_TORCH_CHECK(host_cache.device().is_cpu(), "host_cache must be CPU memory");
   STD_TORCH_CHECK(hot_cache.is_cuda(), "hot_cache must be on CUDA");
   STD_TORCH_CHECK(global_indices.is_cuda() && hot_indices.is_cuda() &&
@@ -613,11 +674,11 @@ void hisparse_gather_plan(torch::stable::Tensor const& host_cache,
   const auto top_k = static_cast<int32_t>(global_indices.size(1));
 
   const int32_t* num_real_ptr = nullptr;
-  if (num_real_reqs.has_value()) {
-    auto const& num_real = num_real_reqs.value();
+  if (num_real_rows.has_value()) {
+    auto const& num_real = num_real_rows.value();
     STD_TORCH_CHECK(num_real.is_cuda() && num_real.scalar_type() == torch::headeronly::ScalarType::Int &&
                     num_real.numel() >= 1,
-                "num_real_reqs must be int32 on CUDA");
+                "num_real_rows must be int32 on CUDA");
     num_real_ptr = num_real.const_data_ptr<int32_t>();
   }
 
