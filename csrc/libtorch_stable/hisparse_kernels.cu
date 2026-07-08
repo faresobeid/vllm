@@ -206,7 +206,12 @@ __global__ void hisparse_swap_in_kernel(
     const int pos = chunk_idx * kWarpSize + lane_id;
     const bool has_valid_pos = has_valid_chunk && (pos < hot_size);
     const int16_t slot = has_valid_pos ? row_lru[pos] : int16_t(-1);
-    const int32_t cached_g = (slot >= 0) ? row_dgi[slot] : -1;
+    // Corruption tripwire: lru/dgi are long-lived device state; if some
+    // external writer (e.g. stray RDMA into reused VRAM) corrupts a slot
+    // out of [0, hot_size), treat it as no-hit so it degrades to a re-miss
+    // instead of an unbounded dgi read (phases 3/5 bound the write side).
+    const int32_t cached_g =
+        (slot >= 0 && slot < hot_size) ? row_dgi[slot] : -1;
 
     int found_topk_idx = -1;
     if (cached_g >= 0) {
@@ -314,12 +319,21 @@ __global__ void hisparse_swap_in_kernel(
     if (is_miss) {
       const int m = s_chunk_off[chunk_idx] + local_miss_off;
       const int16_t evict_slot = s_lru_out[hot_size - 1 - m];
-      // Reuse s_topk as compacted miss scratch: m < i always holds (done
-      // entries are skipped), so writes never overrun pending reads.
-      s_topk[m] = g;
-      row_out[i] = static_cast<int32_t>(hot_base) + evict_slot;
-      if (row_miss != nullptr) row_miss[i] = 1;
-      row_dgi[evict_slot] = g;
+      if (evict_slot < 0 || evict_slot >= hot_size) {
+        // Corruption tripwire: an out-of-range slot (corrupted lru state,
+        // see phase 2) must not become a hot-cache/dgi write. Resolve the
+        // entry as invalid (-1, masked by attention, not in the miss set);
+        // it re-misses on a later step. Phase 5 re-checks the same
+        // s_lru_out value, so its copy is skipped consistently.
+        row_out[i] = -1;
+      } else {
+        // Reuse s_topk as compacted miss scratch: m < i always holds (done
+        // entries are skipped), so writes never overrun pending reads.
+        s_topk[m] = g;
+        row_out[i] = static_cast<int32_t>(hot_base) + evict_slot;
+        if (row_miss != nullptr) row_miss[i] = 1;
+        row_dgi[evict_slot] = g;
+      }
     }
   }
   __syncthreads();
@@ -351,6 +365,11 @@ __global__ void hisparse_swap_in_kernel(
   for (int m = warp_id; m < total_misses; m += NUM_WARPS) {
     const int32_t g = s_topk[m];
     const int16_t evict_slot = s_lru_out[hot_size - 1 - m];
+    if (evict_slot < 0 || evict_slot >= hot_size) {
+      // Corruption tripwire (see phase 3): phase 3 skipped this entry, so
+      // s_topk[m] is stale; skip the copy instead of writing out of range.
+      continue;
+    }
     char* dst = hot_cache + (hot_base + evict_slot) * row_bytes;
 
     if (g >= 0 && g < host_rows) {

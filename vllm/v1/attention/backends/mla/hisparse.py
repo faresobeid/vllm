@@ -200,6 +200,50 @@ def _leader_coordinators(
 _PINNED_STAGING: torch.Tensor | None = None
 _PINNED_STAGING_EVENT: torch.cuda.Event | None = None
 
+# Host ranges the model runner pinned via cudaHostRegister for the
+# host-resident pool. torch's Tensor.is_pinned() only recognizes memory from
+# its own caching host allocator, so bind_source_cache consults this registry
+# for the fail-loud "pool must be pinned" check.
+_REGISTERED_HOST_RANGES: list[tuple[int, int]] = []
+
+def note_registered_host_range(ptr: int, nbytes: int) -> None:
+    _REGISTERED_HOST_RANGES.append((ptr, nbytes))
+
+def discard_registered_host_range(ptr: int) -> None:
+    global _REGISTERED_HOST_RANGES
+    _REGISTERED_HOST_RANGES = [
+        (p, n) for p, n in _REGISTERED_HOST_RANGES if p != ptr
+    ]
+
+def _covers_registered_host_range(ptr: int, nbytes: int) -> bool:
+    return any(
+        p <= ptr and ptr + nbytes <= p + n for p, n in _REGISTERED_HOST_RANGES
+    )
+
+def release_pinned_state() -> bool:
+    """Drop every module/coordinator reference to pinned host memory.
+
+    Graceful teardown (drain-then-free): the runner unpins the host pool
+    itself (cudaHostUnregister); this drops the module-level pinned staging
+    buffer and every coordinator's pool reference so the caller can return
+    the allocator-owned staging blocks to the OS. Shared (index-sharing)
+    coordinators are removed from _STATS by join_group, so they are reached
+    through their leader's group_shared list. Returns whether any pinned
+    reference was held.
+    """
+    global _PINNED_STAGING, _PINNED_STAGING_EVENT
+    released = _PINNED_STAGING is not None
+    _PINNED_STAGING = None
+    _PINNED_STAGING_EVENT = None
+    for leader in _STATS:
+        for coordinator in (leader, *leader.group_shared):
+            if coordinator._host_cache is not None:
+                coordinator._host_cache = None
+                released = True
+    _STATS.clear()
+    return released
+
+
 def _pinned_to_device(values: list[int], device: torch.device) -> torch.Tensor:
     """Copy a small int list to ``device`` via pinned staging (grow-on-demand,
     power-of-2) instead of a per-step pageable tensor."""
@@ -461,7 +505,16 @@ class HiSparseCoordinator:
                 "HiSparse requires a host-resident KV pool; got a KV cache "
                 f"on {kv_cache.device}."
             )
-        if not kv_cache.is_pinned():
+        # The pool is pinned via cudaHostRegister (exact-size, deterministic
+        # unpin at shutdown); torch's is_pinned() only recognizes its own
+        # caching-host-allocator memory, so also accept ranges the model
+        # runner explicitly registered.
+        if not (
+            kv_cache.is_pinned()
+            or _covers_registered_host_range(
+                kv_cache.data_ptr(), kv_cache.nbytes
+            )
+        ):
             raise ValueError(
                 "HiSparse host-resident KV pool must be pinned memory."
             )
@@ -540,16 +593,23 @@ class HiSparseCoordinator:
         if kv_cache.numel() == 0:
             return
         self.bind_source_cache(kv_cache)
-        num_tokens = kv_c_normed.shape[0]
-        assert num_tokens <= self.max_num_reqs
+        # Pad clamp: the forward can run more rows than the scheduler
+        # produced (DP alignment pads to a peer's batch, eager/PIECEWISE pads
+        # to a capture size) while slot_mapping stays unpadded. Real rows are
+        # always a prefix of both, so clamp instead of asserting — a length
+        # mismatch trips the backup kernel's shape check and kills the rank
+        # (and with it the whole DP fleet).
+        num_tokens = min(
+            kv_c_normed.shape[0], slot_mapping.numel(), self.max_num_reqs
+        )
         newest_slots = self._newest_hot_slots[:num_tokens]
         global_slots = slot_mapping[:num_tokens].to(torch.int64)
 
         # -1-padded slots (CUDA-graph padding) are skipped by the backup
         # kernel.
         ops.concat_and_cache_mla(
-            kv_c_normed,
-            k_pe.squeeze(1),
+            kv_c_normed[:num_tokens],
+            k_pe[:num_tokens].squeeze(1),
             self.hot_cache.view(-1, 1, self.row_width),
             newest_slots,
             kv_cache_dtype=kv_cache_dtype,
@@ -587,39 +647,41 @@ class HiSparseCoordinator:
         if kv_cache.numel() == 0:
             return
         self.bind_source_cache(kv_cache)
-        flat_slots = slot_mapping.flatten()[: kv_c_normed.shape[0]]
-        valid_mask = flat_slots >= 0
-        valid = flat_slots[valid_mask].to(device=self.device, dtype=torch.int64)
-        if valid.numel() == 0:
-            return
         # CUDA graph padding can make kv_c_normed/k_pe longer than slot_mapping.
         # Only rows represented by slot_mapping correspond to real KV writes.
-        real_kv_rows = kv_c_normed[: flat_slots.numel()]
-        real_pe_rows = k_pe[: flat_slots.numel()]
+        flat_slots = slot_mapping.flatten()[: kv_c_normed.shape[0]]
+        num_rows = flat_slots.numel()
+        if num_rows == 0:
+            return
+        # Fixed shapes only: -1 (padding) slots are carried through and
+        # skipped by the backup kernel. Masking them out here
+        # (flat_slots[flat_slots >= 0]) would force a device->host sync per
+        # layer per mixed step; a few wasted copies of padded rows into the
+        # staging tensor are cheaper.
+        dst = flat_slots.to(device=self.device, dtype=torch.int64).contiguous()
+        real_kv_rows = kv_c_normed[:num_rows]
+        real_pe_rows = k_pe[:num_rows]
 
         if kv_cache_dtype == "fp8_ds_mla":
-            kv_rows = real_kv_rows[valid_mask]
-            pe_rows = real_pe_rows[valid_mask]
             rows = torch.empty(
-                (valid.numel(), self.row_width),
+                (num_rows, self.row_width),
                 dtype=self.kv_dtype,
                 device=self.device,
             )
             ops.concat_and_cache_mla(
-                kv_rows,
-                pe_rows.squeeze(1),
+                real_kv_rows,
+                real_pe_rows.squeeze(1),
                 rows.view(-1, 1, self.row_width),
-                torch.arange(valid.numel(), dtype=torch.int64, device=self.device),
+                torch.arange(num_rows, dtype=torch.int64, device=self.device),
                 kv_cache_dtype=kv_cache_dtype,
                 scale=k_scale,
             )
         else:
             rows = torch.cat(
-                [real_kv_rows[valid_mask], real_pe_rows[valid_mask].squeeze(1)],
-                dim=-1,
+                [real_kv_rows, real_pe_rows.squeeze(1)], dim=-1
             ).contiguous()
-        src = torch.arange(valid.numel(), dtype=torch.int64, device=self.device)
-        self._backup_rows(rows, src, valid)
+        src = torch.arange(num_rows, dtype=torch.int64, device=self.device)
+        self._backup_rows(rows, src, dst)
 
     # ---------------------------------------------------------------- swap-in
 

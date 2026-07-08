@@ -1429,7 +1429,12 @@ def test_hisparse_host_resident_prefill_write_rows():
 
 @requires_hisparse_ops
 def test_hisparse_host_resident_pool():
-    """The pinned host KV pool is the only full-size store."""
+    """The pinned host KV pool is the only full-size store.
+
+    Also covers the decode-write pad clamp: the forward can run more KV rows
+    than slot_mapping has entries (DP alignment / capture padding), and
+    write_newest_rows must ignore the extra rows.
+    """
     device = torch.device(DEVICE_TYPE)
     block_size = 4
     row_width = 8
@@ -1453,9 +1458,10 @@ def test_hisparse_host_resident_pool():
     slot_mapping = torch.tensor([newest_global], dtype=torch.int64, device=device)
 
     # Decode-step write: newest row lands in the reserved hot slot AND in the
-    # host pool at its global slot.
-    kv_c = torch.randn(1, row_width - 2, device=device)
-    k_pe = torch.randn(1, 1, 2, device=device)
+    # host pool at its global slot. kv/k_pe carry two extra padding rows
+    # beyond the single-entry slot mapping; the clamp must drop them.
+    kv_c = torch.randn(3, row_width - 2, device=device)
+    k_pe = torch.randn(3, 1, 2, device=device)
     coordinator.write_newest_rows(
         kv_c, k_pe, kv_pool, slot_mapping, "auto",
         torch.tensor(1.0, device=device),
@@ -1465,6 +1471,10 @@ def test_hisparse_host_resident_pool():
     torch.testing.assert_close(flat_pool[newest_global], expected_row)
     torch.testing.assert_close(
         coordinator.hot_cache[buf].cpu(), expected_row
+    )
+    # The padding rows must not spill into the next row's reserved slot.
+    torch.testing.assert_close(
+        coordinator.hot_cache[stride + buf].cpu(), torch.zeros(row_width)
     )
 
     # Swap-in: positions 0 and 5 (slots 8, 1) miss -> copied from the host
@@ -1514,6 +1524,219 @@ def test_hisparse_host_resident_pool():
     torch.testing.assert_close(
         flat_hot[idx].cpu(), torch.cat([kv_c2[0], k_pe2[0, 0]]).cpu()
     )
+
+
+@requires_hisparse_ops
+def test_hisparse_mixed_batch_bf16_row_split(
+    default_vllm_config, dist_init, workspace_init
+):
+    """Host-resident mixed batch on the bf16 path is row-split.
+
+    Two long-context decode requests + one short local-prefill chunk: decode
+    tokens must be served from the hot buffer (swap-in) and only the prefill
+    rows' blocks staged host->GPU, with the stitched output matching the
+    device-resident whole-batch reference.
+    """
+    ok, reason = flashmla.is_flashmla_sparse_supported()
+    if not ok:
+        pytest.skip(reason)
+
+    from vllm.v1.attention.backends.mla import flashmla_sparse as _fms
+
+    device = torch.device(DEVICE_TYPE)
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+
+    num_heads = 64
+    kv_lora_rank = 512
+    qk_nope_head_dim = 128
+    qk_rope_head_dim = 64
+    v_head_dim = 128
+    head_size = kv_lora_rank + qk_rope_head_dim
+    topk_tokens = 128
+    block_size = 64
+
+    # Long decode contexts + a short prefill chunk (router shortcut shape).
+    batch_spec = BatchSpec(seq_lens=[2048, 2048, 192], query_lens=[1, 1, 64])
+    max_seqlen = max(batch_spec.seq_lens)
+    total_cache_tokens = sum(batch_spec.seq_lens)
+    total_tokens = batch_spec.compute_num_tokens()
+
+    vllm_config = create_vllm_config(
+        model_name="deepseek-ai/DeepSeek-V2-Lite-Chat",
+        tensor_parallel_size=1,
+        max_model_len=max_seqlen,
+        num_gpu_blocks=max(2048, cdiv(total_cache_tokens, block_size) + 1),
+        block_size=block_size,
+        hf_config_override={
+            "index_topk": topk_tokens,
+            "attn_module_list_cfg": [{"topk_tokens": topk_tokens}],
+        },
+    )
+    vllm_config.attention_config.hisparse_config = {
+        "device_buffer_size": 2 * topk_tokens,
+        "host_pool_gib": 1.0,
+    }
+    model_config = vllm_config.model_config
+    model_config.hf_text_config = SimpleNamespace(
+        q_lora_rank=None,
+        kv_lora_rank=kv_lora_rank,
+        qk_nope_head_dim=qk_nope_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        v_head_dim=v_head_dim,
+        model_type="deepseek_v2",
+    )
+    model_config.dtype = dtype
+    model_config.get_num_attention_heads = MethodType(
+        lambda self, parallel_config: num_heads, model_config
+    )
+    model_config.get_num_kv_heads = MethodType(
+        lambda self, parallel_config: 1, model_config
+    )
+    model_config.get_head_size = MethodType(lambda self: head_size, model_config)
+    model_config.get_sliding_window = MethodType(lambda self: None, model_config)
+    # create_hisparse_coordinator sizes hot buffers per layer.
+    model_config.get_num_layers = MethodType(
+        lambda self, parallel_config: 1, model_config
+    )
+
+    kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec,
+        vllm_config.cache_config.block_size,
+        device,
+        arange_block_indices=True,
+    )
+
+    # Prepopulate every position of every sequence so the forward needs no
+    # KV-cache update (the row split itself is what is under test).
+    kv_c_contexts = [
+        torch.rand(s_len, kv_lora_rank, dtype=dtype, device=device)
+        for s_len in batch_spec.seq_lens
+    ]
+    k_pe_contexts = [
+        torch.rand(s_len, 1, qk_rope_head_dim, dtype=dtype, device=device)
+        for s_len in batch_spec.seq_lens
+    ]
+    kv_cache = create_and_prepopulate_kv_cache(
+        kv_c_contexts=kv_c_contexts,
+        k_pe_contexts=k_pe_contexts,
+        block_size=vllm_config.cache_config.block_size,
+        head_size=head_size,
+        dtype=dtype,
+        device=device,
+        num_blocks=vllm_config.cache_config.num_gpu_blocks,
+        common_attn_metadata=common_attn_metadata,
+        randomize_blocks=False,
+        kv_cache_dtype="auto",
+    )
+
+    builder_cls = FlashMLASparseBackend.get_builder_cls()
+    builder = builder_cls(kv_cache_spec, ["placeholder"], vllm_config, device)
+    metadata = builder.build(
+        common_prefix_len=0, common_attn_metadata=common_attn_metadata
+    )
+    num_decodes = metadata.num_decodes
+    assert num_decodes == 2 and metadata.num_decode_tokens == 2
+
+    # Per-token sparse indices bounded by each token's position, with unique
+    # offsets and -1 padding (same construction as the decode parity test).
+    positions = []
+    for i in range(batch_spec.batch_size):
+        ctx_len = batch_spec.seq_lens[i] - batch_spec.query_lens[i]
+        positions.extend(ctx_len + q_idx for q_idx in range(batch_spec.query_lens[i]))
+    sparse_indices = torch.empty(
+        total_tokens, topk_tokens, dtype=torch.int32, device=device
+    )
+    for tok_idx in range(total_tokens):
+        max_valid_idx = positions[tok_idx]
+        offset = tok_idx * 7  # Prime number for varied offsets
+        num_valid = min(topk_tokens // 2, max_valid_idx + 1)
+        valid_range = torch.arange(num_valid, device=device, dtype=torch.int32)
+        sparse_indices[tok_idx] = torch.cat(
+            [
+                (valid_range + offset) % (max_valid_idx + 1),
+                torch.full(
+                    (topk_tokens - num_valid,), -1, device=device, dtype=torch.int32
+                ),
+            ]
+        )
+
+    q = torch.rand(total_tokens, num_heads, head_size, dtype=dtype, device=device)
+    mock_indexer = SimpleNamespace(
+        topk_indices_buffer=sparse_indices, topk_tokens=topk_tokens
+    )
+
+    impl_cls = FlashMLASparseBackend.get_impl_cls()
+    with set_current_vllm_config(vllm_config):
+        impl = impl_cls(
+            num_heads=num_heads,
+            head_size=head_size,
+            scale=1.0 / math.sqrt(head_size),
+            num_kv_heads=1,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="auto",
+            logits_soft_cap=None,
+            attn_type="decoder",
+            kv_sharing_target_layer_name=None,
+            q_lora_rank=None,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            qk_head_dim=qk_nope_head_dim + qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            kv_b_proj=None,
+            indexer=mock_indexer,
+        )
+    assert impl.hisparse_coordinator is not None
+    impl.prepare_hisparse_for_batch(metadata)
+    assert not impl._hisparse_decode_batch
+
+    # Device-resident reference: the whole batch converted against the full
+    # block table and run as one kernel call over the GPU cache.
+    ref_topk, ref_topk_length = triton_convert_req_index_to_global_index(
+        metadata.req_id_per_token,
+        metadata.block_table,
+        sparse_indices,
+        BLOCK_SIZE=metadata.block_size,
+        NUM_TOPK_TOKENS=topk_tokens,
+        return_valid_counts=True,
+    )
+    reference = impl._bf16_flash_mla_kernel(q, kv_cache, ref_topk, ref_topk_length)
+
+    # Host-resident pool with identical contents.
+    kv_pool = kv_cache.cpu().pin_memory()
+
+    _fms._HISPARSE_PREFILL_REMAP = None
+    staging_calls = []
+    original_stage = impl._hisparse_host_prefill_cache
+
+    def spy_stage(self, kv, block_table, seq_lens):
+        staged, staged_bt = original_stage(kv, block_table, seq_lens)
+        staging_calls.append((block_table.clone(), seq_lens.clone(), staged.shape))
+        return staged, staged_bt
+
+    impl._hisparse_host_prefill_cache = MethodType(spy_stage, impl)
+
+    backend_output = impl._forward_bf16_kv(q, kv_pool, sparse_indices, metadata)
+    torch.cuda.synchronize()
+
+    # Only the prefill rows' blocks were staged: the decode rows' 2048-token
+    # contexts (32 blocks each) must stay off the staging gather.
+    assert len(staging_calls) == 1
+    staged_bt, staged_seq_lens, staged_shape = staging_calls[0]
+    torch.testing.assert_close(
+        staged_bt, metadata.block_table[num_decodes:], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        staged_seq_lens, metadata.seq_lens[num_decodes:], rtol=0, atol=0
+    )
+    prefill_blocks = cdiv(batch_spec.seq_lens[-1], block_size)
+    assert staged_shape[0] <= prefill_blocks + 1  # +1: block-0 tail padding
+
+    assert backend_output.shape == reference.shape
+    torch.testing.assert_close(backend_output, reference, rtol=0.01, atol=0.01)
 
 
 def test_hisparse_prefill_staging_remap():

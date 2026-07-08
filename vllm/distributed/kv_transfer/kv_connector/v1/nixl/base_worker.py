@@ -2009,6 +2009,7 @@ class NixlBaseConnectorWorker:
 
         block_ids_for_blocksize_post_process = defaultdict(list)
         block_ids_for_heterogeneous_attn_post_process = list[list[int]]()
+        late_duplicates: list[str] = []
         for req_id in done_recving:
             # clean up metadata for completed requests
             meta = self._recving_metadata.pop(req_id, None)
@@ -2017,11 +2018,12 @@ class NixlBaseConnectorWorker:
                 # handles cannot be aborted, so a handle of a request whose
                 # failure was already reported can still reach its terminal
                 # state in a later poll cycle. Nothing is left to
-                # post-process; the scheduler tolerates the duplicate
-                # finished notification.
+                # post-process, and the request must not be reported finished
+                # a second time.
                 logger.debug(
                     "Skipping late duplicate completion for request %s", req_id
                 )
+                late_duplicates.append(req_id)
                 continue
 
             # Skip KV sync and post-processing for failed requests
@@ -2081,6 +2083,8 @@ class NixlBaseConnectorWorker:
             del self._reqs_to_send[req_id]
             done_sending.add(req_id)
 
+        for req_id in late_duplicates:
+            done_recving.discard(req_id)
         return done_sending, done_recving
 
     def _get_new_notifs(self) -> set[str]:
@@ -2554,23 +2558,45 @@ class NixlBaseConnectorWorker:
         if not hasattr(self, "_handshake_initiation_executor"):
             # error happens during init, no need to shutdown
             return
-        self._handshake_initiation_executor.shutdown(wait=False)
-        for handles in self._recving_transfers.values():
-            for handle in handles:
-                self.nixl_wrapper.release_xfer_handle(handle)
+        self._handshake_initiation_executor.shutdown(wait=False, cancel_futures=True)
+        # Handle releases can fail against a dead peer (e.g. releasing an
+        # in-flight PROC handle after the prefill side was killed). Teardown
+        # must still reach the MR deregister and the reference clears below,
+        # so tolerate and log per-stage failures instead of aborting.
+        try:
+            for handles in self._recving_transfers.values():
+                for handle in handles:
+                    self.nixl_wrapper.release_xfer_handle(handle)
+        except Exception:
+            logger.exception("NIXL transfer-handle release failed at shutdown.")
         self._recving_transfers.clear()
-        for handle in self.src_xfer_handles_by_block_size.values():
-            self.nixl_wrapper.release_dlist_handle(handle)
-        self.src_xfer_handles_by_block_size.clear()
-        for handles in self.src_xfer_handles_by_tp_ratio.values():
-            for handle in handles:
+        try:
+            for handle in self.src_xfer_handles_by_block_size.values():
                 self.nixl_wrapper.release_dlist_handle(handle)
+            for handles in self.src_xfer_handles_by_tp_ratio.values():
+                for handle in handles:
+                    self.nixl_wrapper.release_dlist_handle(handle)
+            for handle in self._dram_src_handles_by_block_size.values():
+                self.nixl_wrapper.release_dlist_handle(handle)
+        except Exception:
+            logger.exception("NIXL dlist-handle release failed at shutdown.")
+        self.src_xfer_handles_by_block_size.clear()
         self.src_xfer_handles_by_tp_ratio.clear()
-        for handle in self._dram_src_handles_by_block_size.values():
-            self.nixl_wrapper.release_dlist_handle(handle)
         self._dram_src_handles_by_block_size.clear()
-        for engine_id in list(self._remote_agents):
-            self._cleanup_remote_engine(engine_id, log_eviction=False)
-        for desc in self._registered_descs:
-            self.nixl_wrapper.deregister_memory(desc)
-        self._registered_descs.clear()
+        try:
+            for engine_id in list(self._remote_agents):
+                self._cleanup_remote_engine(engine_id, log_eviction=False)
+        except Exception:
+            logger.exception("NIXL remote-engine cleanup failed at shutdown.")
+        try:
+            for desc in self._registered_descs:
+                self.nixl_wrapper.deregister_memory(desc)
+        finally:
+            self._registered_descs.clear()
+            # Drop the kv-cache tensor references: releasing the HiSparse
+            # pinned host pool must not depend on this worker object becoming
+            # unreachable (an in-flight handshake future or stray reference
+            # would otherwise keep hundreds of GiB alive past
+            # model_runner.shutdown()).
+            self.device_kv_caches = {}
+            self.host_xfer_buffers = {}

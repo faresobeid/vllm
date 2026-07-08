@@ -6500,8 +6500,31 @@ class GPUModelRunner(
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
 
+        # HiSparse drain-then-free: unpin the host pool while the process can
+        # still be reaped. Runs before _cleanup_profiling_kv_cache(), whose
+        # torch.accelerator.synchronize() raises on a poisoned CUDA context
+        # and would skip this block on crashed engines. Ordering invariant:
+        # Worker.shutdown() runs ensure_kv_transfer_shutdown() (NIXL MR
+        # deregister + mooncake store close) before model_runner.shutdown(),
+        # so no RDMA registration covers these pages when they unpin.
+        self._hisparse_unregister_host_pool()
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
+        # Drop coordinator/module references to the (now unpinned) pool and
+        # the small pinned staging buffers, then return the staging blocks to
+        # the OS. Cheap: the multi-hundred-GiB pool is no longer allocator-
+        # owned, only the MB-scale grow-on-demand staging is.
+        from vllm.v1.attention.backends.mla.hisparse import release_pinned_state
+
+        if release_pinned_state():
+            try:
+                torch._C._host_emptyCache()
+            except RuntimeError as e:
+                logger.warning(
+                    "HiSparse: pinned-staging empty_cache failed at "
+                    "shutdown: %s",
+                    e,
+                )
         if current_platform.is_rocm():
             # Drop captured graphs before distributed teardown. On ROCm, delayed
             # graph destruction can surface HSA faults in the next engine startup.
@@ -6518,7 +6541,68 @@ class GPUModelRunner(
             torch.accelerator.empty_cache()
             torch.accelerator.synchronize()
 
+    def _hisparse_unregister_host_pool(self) -> None:
+        """cudaHostUnregister the HiSparse host pool (drain-then-free).
+
+        Unpinning here, inside the graceful-shutdown window, is interruptible
+        and observable; unpinning at process exit after SIGKILL runs in
+        uninterruptible kernel context, routinely outlives SLURM's kill
+        timeout, and drains the node ("Kill task failed"). On an unusable
+        CUDA context the synchronize below raises and the pool is left
+        registered — unregister could itself hang there, and kernel exit
+        reclaim is the only remaining path (sglang gates its host-pool
+        destroy to graceful exits for the same reason). Also called from
+        _cleanup_profiling_kv_cache() so the profiling-sized pool never gets
+        freed while still registered.
+        """
+        pinned = getattr(self, "_hisparse_pinned_tensors", None)
+        if not pinned:
+            return
+        try:
+            # Drain in-flight gathers/prefetch before unpinning their source.
+            torch.accelerator.synchronize()
+        except RuntimeError as e:
+            logger.warning(
+                "HiSparse: CUDA context unusable at teardown (%s); leaving "
+                "%d host-pool tensors pinned for kernel exit reclaim.",
+                e,
+                len(pinned),
+            )
+            return
+        from vllm.v1.attention.backends.mla.hisparse import (
+            discard_registered_host_range,
+        )
+
+        cudart = torch.cuda.cudart()
+        release_start = time.perf_counter()
+        freed_bytes = 0
+        while pinned:
+            tensor = pinned[-1]
+            err = cudart.cudaHostUnregister(tensor.data_ptr())
+            if err.value != 0:
+                logger.warning(
+                    "HiSparse: cudaHostUnregister failed (code=%d); leaving "
+                    "%d host-pool tensors pinned for kernel exit reclaim.",
+                    err.value,
+                    len(pinned),
+                )
+                # Clear the sticky per-thread last-error so the rest of the
+                # teardown does not surface it as a spurious failure.
+                cudart.cudaGetLastError()
+                break
+            freed_bytes += tensor.nbytes
+            discard_registered_host_range(tensor.data_ptr())
+            pinned.pop()
+        if freed_bytes:
+            logger.info(
+                "HiSparse: unpinned %.1f GiB of host pool in-process in "
+                "%.1fs (drain-then-free).",
+                freed_bytes / 2**30,
+                time.perf_counter() - release_start,
+            )
+
     def _cleanup_profiling_kv_cache(self) -> None:
+        self._hisparse_unregister_host_pool()
         torch.accelerator.synchronize()
         if hasattr(self, "kv_caches") and self.kv_caches:
             for i in range(len(self.kv_caches)):
@@ -7199,12 +7283,44 @@ class GPUModelRunner(
                 # apparent boot hang across a node's ranks), and the pool
                 # never needs it — every slot the scheduler hands out is
                 # written before the indexer can select it.
-                tensor = torch.empty(
-                    kv_cache_tensor.size,
+                #
+                # Pageable alloc + cudaHostRegister instead of
+                # pin_memory=True: the caching host allocator rounds every
+                # block up to the next power of 2 (a 256 GiB pool split
+                # across 78 layers pins ~312 GiB) and releases blocks only
+                # via gc reachability. Registered memory pins exactly
+                # kv_cache_tensor.size and unpins deterministically in
+                # shutdown(), leaving plain pageable pages behind — nothing
+                # for the kernel to reclaim in uninterruptible context after
+                # SIGKILL (the "Kill task failed" node drain).
+                from vllm.v1.attention.backends.mla.hisparse import (
+                    note_registered_host_range,
+                )
+                from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
+
+                # Register a page-aligned, whole-page range (the slack stays
+                # inside this allocation): cudaHostRegister pins at page
+                # granularity, and two tensors sharing a heap page would fail
+                # the second registration (HostMemoryAlreadyRegistered).
+                page = 4096
+                padded_size = round_up(kv_cache_tensor.size, page)
+                backing = torch.empty(
+                    padded_size + page,
                     dtype=torch.int8,
                     device="cpu",
-                    pin_memory=True,
                 )
+                aligned_offset = (-backing.data_ptr()) % page
+                registered = backing[
+                    aligned_offset : aligned_offset + padded_size
+                ]
+                pin_tensor(registered)
+                note_registered_host_range(
+                    registered.data_ptr(), registered.nbytes
+                )
+                if not hasattr(self, "_hisparse_pinned_tensors"):
+                    self._hisparse_pinned_tensors: list[torch.Tensor] = []
+                self._hisparse_pinned_tensors.append(registered)
+                tensor = registered[: kv_cache_tensor.size]
                 host_bytes += kv_cache_tensor.size
             elif kv_cache_tensor.block_stride > 0:
                 # Allocate once; all packed tensors alias the same backing.
