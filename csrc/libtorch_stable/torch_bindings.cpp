@@ -844,10 +844,11 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                 Tensor! hot_indices,"
       "                 Tensor! device_global_indices,"
       "                 Tensor! lru_slots,"
-      "                 Tensor? num_real_reqs,"
+      "                 Tensor? num_real_rows,"
       "                 int region_stride,"
       "                 Tensor(a!)? miss_mask=None,"
-      "                 Tensor(b!)? stats=None) -> ()");
+      "                 Tensor(b!)? stats=None,"
+      "                 int tokens_per_req=1) -> ()");
 
   ops.def(
       "hisparse_gather_plan(Tensor host_cache,"
@@ -855,7 +856,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                     Tensor global_indices,"
       "                     Tensor hot_indices,"
       "                     Tensor miss_mask,"
-      "                     Tensor? num_real_reqs) -> ()");
+      "                     Tensor? num_real_rows) -> ()");
 
   ops.def(
       "hisparse_backup(Tensor src_cache,"
