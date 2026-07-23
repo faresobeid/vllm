@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
@@ -839,6 +839,53 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         if num_decodes > 0:
             prefill_req_ids = prefill_req_ids - num_decodes
         return staged_cache, staged_bt, prefill_req_ids
+
+    def forward_mha(  # type: ignore[override]
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+        k_scale: torch.Tensor,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
+    ) -> None:
+        """Dense-MHA prefill over a host-resident (HiSparse) pool.
+
+        The chunked-context gathers CUDA-read the KV cache, which lives in
+        pinned host memory under HiSparse. Stage the prefill rows' referenced
+        blocks onto the GPU first (shared layer-invariant remap, same as the
+        sparse local-prefill path) and rebase the prefill block table onto
+        the staged copy; new-token attention never touches the cache.
+        """
+        prefill = attn_metadata.prefill
+        if (
+            self.hisparse_coordinator is not None
+            and kv_c_and_k_pe_cache.device.type == "cpu"
+            and prefill is not None
+            and prefill.chunked_context is not None
+        ):
+            assert attn_metadata.seq_lens is not None
+            num_decodes = attn_metadata.num_decodes
+            kv_c_and_k_pe_cache, staged_bt = self._hisparse_host_prefill_cache(
+                kv_c_and_k_pe_cache,
+                prefill.block_table,
+                attn_metadata.seq_lens[num_decodes:],
+            )
+            attn_metadata = replace(
+                attn_metadata, prefill=replace(prefill, block_table=staged_bt)
+            )
+        super().forward_mha(
+            q,
+            kv_c_normed,
+            k_pe,
+            kv_c_and_k_pe_cache,
+            attn_metadata,  # type: ignore[arg-type]
+            k_scale,
+            output=output,
+            output_scale=output_scale,
+        )
 
     def do_kv_cache_update(
         self,
